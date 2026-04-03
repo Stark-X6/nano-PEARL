@@ -70,12 +70,12 @@ class BaseConfig:
 class PEARLConfig:
     draft_model_path: str
     target_model_path: str
-    draft_tensor_parallel_size: int = 2
+    draft_tensor_parallel_size: int = 1
     target_tensor_parallel_size: int = 2
     draft_group_name: str = "draft_group"
     target_group_name: str = "target_group"
-    max_num_batched_tokens: int = 16384 # 8192 for 40GB GPUs
-    max_num_seqs: int = 512 # 128 or 256 for 40GB GPUs
+    max_num_batched_tokens: int = 8192 # 8192 for 40GB GPUs
+    max_num_seqs: int = 128 # 128 or 256 for 40GB GPUs
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     kvcache_block_size: int = 256
