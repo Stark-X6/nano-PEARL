@@ -38,8 +38,7 @@ class SLOTargetRunner(ModelRunnerBase):
 
         super().__init__(config, rank, event, control_event)
 
-        if self.rank == 0:
-            logger.info("[SLOTargetRunner] Initialized with per-seq gamma verification.", color="green")
+        # Code after super().__init__() is UNREACHABLE — loop() blocks forever.
 
     def add_request(self, seq):
         """Override to track SLOSequence."""

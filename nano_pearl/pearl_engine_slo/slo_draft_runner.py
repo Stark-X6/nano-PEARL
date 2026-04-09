@@ -41,9 +41,12 @@ class SLODraftRunner(ModelRunnerBase):
         self._slo_verify_step_latency_ms = getattr(config, '_slo_verify_step_latency_ms', -1.0)
         self._slo_total_budget = getattr(config, '_slo_total_budget', -1)
 
-        super().__init__(config, rank, event, control_event)
+        # MUST initialize these BEFORE super().__init__(), which calls
+        # init_shared_memory() -> self.loop() (blocking). Anything set
+        # after super().__init__() is unreachable.
+        self._slo_seqs = {}  # seq_id -> SLOSequence
 
-        # Initialize SLO scheduler
+        # Initialize SLO scheduler before super().__init__
         class _SchedConfig:
             pass
         _sc = _SchedConfig()
@@ -52,16 +55,15 @@ class SLODraftRunner(ModelRunnerBase):
         _sc.correction_factor = self._slo_correction_factor
         self.slo_scheduler = SLOScheduler(_sc)
 
-        # Track SLOSequences (populated by add_request override)
-        self._slo_seqs = {}  # seq_id -> SLOSequence
+        # Latency defaults
+        self.baseline_latency_ms = self._slo_baseline_latency_ms if self._slo_baseline_latency_ms > 0 else 30.0
+        self.draft_step_latency_ms = self._slo_draft_step_latency_ms if self._slo_draft_step_latency_ms > 0 else 5.0
+        self.verify_step_latency_ms = self._slo_verify_step_latency_ms if self._slo_verify_step_latency_ms > 0 else 25.0
 
-        # Latency profiling results (set after auto_set_gamma or manual config)
-        if self._slo_baseline_latency_ms > 0:
-            self.baseline_latency_ms = self._slo_baseline_latency_ms
-        # draft_step_latency_ms and verify_step_latency_ms set after profiling
+        super().__init__(config, rank, event, control_event)
 
-        if self.rank == 0:
-            logger.info("[SLODraftRunner] Initialized with SLO-aware budget allocation.", color="green")
+        # Code after super().__init__() is UNREACHABLE — loop() blocks forever.
+        # All initialization must go above.
 
     def add_request(self, seq):
         """Override to wrap Sequence in SLOSequence."""
