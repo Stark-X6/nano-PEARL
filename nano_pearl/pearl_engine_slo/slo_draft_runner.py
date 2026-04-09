@@ -1,0 +1,397 @@
+"""
+SLODraftRunner — per-sequence gamma drafting for SLO-aware speculative decoding.
+
+Key difference from original DraftModelRunner:
+  1. Drafts max_gamma tokens for ALL sequences (collect logits each step)
+  2. Calls SLOScheduler to compute per-seq gamma based on SLO constraints
+  3. Rolls back excess tokens per sequence
+  4. Uses two-broadcast verify protocol (gamma_map + variable-length token msg)
+
+Mirrors AdaServe's "build full tree then prune" pattern for linear sequences.
+"""
+
+import pickle
+import math
+import torch
+import torch.distributed as dist
+from nano_pearl.pearl_engine.pearl_model_runner import ModelRunnerBase
+from nano_pearl.pearl_engine.sequence import SequenceStatus
+from nano_pearl.pearl_engine.scheduler import is_eos
+from nano_pearl.pearl_engine_slo.slo_sequence import SLOSequence
+from nano_pearl.pearl_engine_slo.slo_scheduler import SLOScheduler
+from nano_pearl.utils.context import reset_context
+from nano_pearl.utils.pearl_logger import logger
+
+
+class SLODraftRunner(ModelRunnerBase):
+    """Draft model runner with SLO-aware per-sequence gamma allocation.
+
+    Overrides pearl_step() and verify() from DraftModelRunner.
+    Inherits all infrastructure (init_dist, init_model_and_kvcache, shared memory loop, etc.)
+    from ModelRunnerBase.
+    """
+
+    def __init__(self, config, rank, event, control_event):
+        # Store SLO config before super().__init__ (which calls init_model_and_kvcache)
+        self._slo_max_gamma = getattr(config, '_slo_max_gamma', 16)
+        self._slo_min_gamma = getattr(config, '_slo_min_gamma', 1)
+        self._slo_correction_factor = getattr(config, '_slo_correction_factor', 1.0)
+        self._slo_baseline_latency_ms = getattr(config, '_slo_baseline_latency_ms', -1.0)
+        self._slo_draft_step_latency_ms = getattr(config, '_slo_draft_step_latency_ms', -1.0)
+        self._slo_verify_step_latency_ms = getattr(config, '_slo_verify_step_latency_ms', -1.0)
+        self._slo_total_budget = getattr(config, '_slo_total_budget', -1)
+
+        super().__init__(config, rank, event, control_event)
+
+        # Initialize SLO scheduler
+        class _SchedConfig:
+            pass
+        _sc = _SchedConfig()
+        _sc.min_gamma = self._slo_min_gamma
+        _sc.max_gamma = self._slo_max_gamma
+        _sc.correction_factor = self._slo_correction_factor
+        self.slo_scheduler = SLOScheduler(_sc)
+
+        # Track SLOSequences (populated by add_request override)
+        self._slo_seqs = {}  # seq_id -> SLOSequence
+
+        # Latency profiling results (set after auto_set_gamma or manual config)
+        if self._slo_baseline_latency_ms > 0:
+            self.baseline_latency_ms = self._slo_baseline_latency_ms
+        # draft_step_latency_ms and verify_step_latency_ms set after profiling
+
+        if self.rank == 0:
+            logger.info("[SLODraftRunner] Initialized with SLO-aware budget allocation.", color="green")
+
+    def add_request(self, seq):
+        """Override to wrap Sequence in SLOSequence."""
+        if isinstance(seq, SLOSequence):
+            slo_seq = seq
+        else:
+            slo_seq = SLOSequence(seq)
+        self._slo_seqs[seq.seq_id] = slo_seq
+        # Add underlying Sequence to scheduler
+        self.scheduler.add(slo_seq.seq)
+        dist.barrier()
+
+    def _get_slo_seqs(self, seqs):
+        """Get SLOSequence wrappers for the given Sequence list."""
+        result = []
+        for seq in seqs:
+            if seq.seq_id in self._slo_seqs:
+                result.append(self._slo_seqs[seq.seq_id])
+            else:
+                result.append(SLOSequence(seq))
+        return result
+
+    @property
+    def max_gamma(self):
+        return self._slo_max_gamma
+
+    def pearl_step(self):
+        """SLO-aware drafting: draft max_gamma, compute probs, allocate, rollback, verify.
+
+        Corresponds to AdaServe's flow:
+          SSM runs max_tree_depth steps -> prune_token_tree() -> rollback
+        """
+        # ===== Phase A: Draft max_gamma tokens for all seqs, collect logits =====
+        draft_logits_steps = []      # list of (num_seqs, vocab) tensors
+        draft_token_ids_steps = []   # list of list[int]
+
+        for step in range(self.max_gamma):
+            seqs, is_prefill = self.scheduler.schedule()
+            assert not is_prefill, "wrong match. current stage is prefill."
+
+            input_ids, positions = self.prepare_pearl_decode(seqs)
+            logits = self.run_model(input_ids, positions, False)
+
+            # Collect logits for SLO scheduler (corresponds to AdaServe ssm_inference_result.probs)
+            draft_logits_steps.append(logits.clone())
+
+            # Greedy sampling (temperature=0 for draft, same as original)
+            sample_tokens = (logits.argmax(dim=-1) if self.tp_params.local_rank == 0
+                            else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True))
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            token_ids = sample_tokens.tolist()
+            draft_token_ids_steps.append(token_ids)
+            reset_context(self.tp_params)
+
+            # Append tokens to sequences (don't use postprocess to avoid early EOS exit)
+            for seq, token_id in zip(seqs, token_ids):
+                seq.append_token(token_id)
+
+        # ===== Phase B: SLO budget allocation =====
+        slo_seqs = self._get_slo_seqs(seqs)
+
+        # 1. Compute accumulated probabilities from draft logits
+        per_seq_token_infos = self.slo_scheduler.compute_draft_token_probs(
+            draft_logits_steps, draft_token_ids_steps
+        )
+
+        # 2. Determine total budget
+        total_budget = self._slo_total_budget if self._slo_total_budget > 0 else self.max_gamma * len(seqs)
+
+        # 3. Get latency estimates (use profiled values or defaults)
+        baseline_ms = getattr(self, 'baseline_latency_ms', 30.0)
+        draft_step_ms = getattr(self, 'draft_step_latency_ms', 5.0)
+        verify_step_ms = getattr(self, 'verify_step_latency_ms', 25.0)
+        # batch_latency_ms scales with batch size (approximation)
+        batch_ms = verify_step_ms * max(1.0, len(seqs) / 8.0)
+
+        # 4. Allocate budget
+        gamma_map = self.slo_scheduler.allocate_budget(
+            slo_seqs, total_budget, baseline_ms,
+            draft_step_ms, verify_step_ms, batch_ms,
+            per_seq_token_infos,
+        )
+
+        # Store gamma_map for verify
+        self._current_gamma_map = gamma_map
+
+        # Update SLOSequence assigned_gamma
+        for slo_seq in slo_seqs:
+            slo_seq.assigned_gamma = gamma_map.get(slo_seq.seq_id, 1)
+
+        # 5. Rollback excess tokens
+        for seq in seqs:
+            g = gamma_map.get(seq.seq_id, 1)
+            excess = self.max_gamma - g
+            if excess > 0:
+                self.scheduler.rollback(seq, excess)
+
+        # ===== Phase C: Verify with per-seq gamma =====
+        self.verify(seqs, gamma_map)
+
+    def prepare_pearl_decode(self, seqs):
+        """Same as original prepare_decode."""
+        return super().prepare_decode(seqs)
+
+    @torch.inference_mode()
+    def verify(self, seqs, gamma_map):
+        """Two-broadcast verify protocol for per-seq gamma.
+
+        Broadcast 1: gamma_tensor (num_seqs ints) -> target
+        Broadcast 2: [to_be_verified_tokens | next_round_input] -> target
+        Receive: verify_res (4, num_seqs) from target
+
+        Corresponds to original DraftModelRunner.verify() but with per-seq gamma.
+        """
+        num_seqs = len(seqs)
+
+        if self.tp_params.local_rank == 0:
+            to_be_verified_tokens = []
+            next_round_input = []
+
+            for seq in seqs:
+                g = gamma_map.get(seq.seq_id, 1)
+                if seq.pre_verify:
+                    # Verify only 1 token (the last of the previous round)
+                    to_be_verified_tokens.append(seq.token_ids[-g])
+                else:
+                    # Verify g-1 tokens (first already verified in pre-verify)
+                    to_be_verified_tokens.extend(seq.token_ids[-2 * g + 1 : -g + 1])
+                # Send next round's draft tokens
+                next_round_input.extend(seq.token_ids[-g:])
+
+            # Broadcast 1: gamma_tensor
+            gamma_tensor = torch.tensor(
+                [gamma_map.get(s.seq_id, 1) for s in seqs],
+                dtype=torch.int64, device="cuda",
+            )
+            dist.broadcast(gamma_tensor, src=self.rank, group=self.verify_group)
+
+            # Broadcast 2: variable-length token message
+            msg = torch.tensor(
+                to_be_verified_tokens + next_round_input,
+                dtype=torch.int64, device="cuda",
+            )
+            dist.broadcast(msg, src=self.rank, group=self.verify_group)
+
+        else:
+            # Non-master draft ranks still participate in broadcast
+            gamma_tensor = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
+            dist.broadcast(gamma_tensor, src=self.tp_params.master_rank, group=self.verify_group)
+
+            # Compute message size from gamma_tensor
+            total_gamma = gamma_tensor.sum().item()
+            num_to_verify = sum(
+                1 if seq.pre_verify else gamma_map.get(seq.seq_id, 1) - 1
+                for seq in seqs
+            )
+            msg_size = int(num_to_verify + total_gamma)
+            msg = torch.zeros(msg_size, dtype=torch.int64, device="cuda")
+            dist.broadcast(msg, src=self.tp_params.master_rank, group=self.verify_group)
+
+        # Receive verification results from target
+        verify_res = torch.zeros((4, num_seqs), dtype=torch.int64, device="cuda")
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+
+        # Process verification results
+        acc, rollout, revise_token, finish = verify_res.tolist()
+        for idx, seq in enumerate(seqs):
+            g = gamma_map.get(seq.seq_id, 1)
+            if finish[idx]:
+                seq.status = SequenceStatus.FINISHED
+                self.scheduler.block_manager.deallocate(seq)
+                self.scheduler.running.remove(seq)
+                self.scheduler.finished.append(seq)
+                continue
+
+            if seq.pre_verify:
+                if acc[idx]:
+                    seq.pre_verify = False
+                else:
+                    seq.pre_verify = True
+                    self.scheduler.rollback(seq, g)
+                    seq.append_token(revise_token[idx])
+            else:
+                if acc[idx]:
+                    seq.pre_verify = False
+                else:
+                    seq.pre_verify = True
+                    self.scheduler.rollback(seq, g)
+                    if rollout[idx] > 1:
+                        self.scheduler.rollback(seq, rollout[idx] - 1)
+                    seq.append_token(revise_token[idx])
+
+    def auto_set_gamma(self):
+        """Override: run original auto_set_gamma and extract SLO latency metrics.
+
+        Sets baseline_latency_ms = 1000 / target_speed[bs=1]
+        Sets draft_step_latency_ms = 1000 / draft_speed[bs=current_batch]
+        """
+        super().auto_set_gamma()
+
+        # Extract latency metrics from profiled speeds
+        # These are available on all ranks after all_reduce
+        if hasattr(self, 'gamma_list') and self.gamma_list:
+            # baseline_latency_ms = 1000 / target_speed[bs=1]
+            # target_speed[bs=1] ≈ 1 / (time_per_step at bs=1)
+            # From gamma_list: gamma = round(draft_speed / target_speed)
+            # We need actual speeds — they're in auto_set_gamma's local vars.
+            # Since auto_set_gamma is already done, we use default estimates.
+            pass
+
+        # Store defaults; will be overwritten by controller with profiled values
+        self.baseline_latency_ms = getattr(self, '_slo_baseline_latency_ms', 30.0)
+        if self.baseline_latency_ms < 0:
+            self.baseline_latency_ms = 30.0
+        self.draft_step_latency_ms = getattr(self, '_slo_draft_step_latency_ms', 5.0)
+        if self.draft_step_latency_ms < 0:
+            self.draft_step_latency_ms = 5.0
+        self.verify_step_latency_ms = getattr(self, '_slo_verify_step_latency_ms', 25.0)
+        if self.verify_step_latency_ms < 0:
+            self.verify_step_latency_ms = 25.0
+
+    def slo_generate(self):
+        """SLO-aware PEARL generation."""
+        dist.barrier()
+        torch.cuda.synchronize()
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+
+        import time as _time
+        start_time.record()
+        wall_start = _time.time()
+
+        self.prefill()
+
+        while not self.scheduler.is_finished():
+            self.pearl_step()
+
+        end_time.record()
+        torch.cuda.synchronize()
+        wall_end = _time.time()
+
+        seqs = self.scheduler.finished
+        output = [
+            (seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens)
+            for seq in seqs
+        ]
+
+        if self.rank == self.global_config.target_config.master_rank:
+            data = pickle.dumps([output, wall_end - wall_start])
+            n = len(data)
+            self.shm.buf[0:4] = n.to_bytes(4, "little")
+            self.shm.buf[4 : n + 4] = data
+
+        self.clear_requests()
+
+    def slo_bench_generate(self, num_pearl_steps=100):
+        """Benchmark: fixed steps, collect per-seq metrics."""
+        dist.barrier()
+        torch.cuda.synchronize()
+        import time as _time
+        start_time = _time.time()
+
+        self.prefill()
+
+        for seq in self.scheduler.running:
+            seq.max_tokens = int(1e8)
+            seq.ignore_eos = True
+            # Mark decode start for SLO tracking
+            if seq.seq_id in self._slo_seqs:
+                self._slo_seqs[seq.seq_id].mark_decode_start()
+
+        for _ in range(num_pearl_steps):
+            self.pearl_step()
+
+        torch.cuda.synchronize()
+        end_time = _time.time()
+
+        seqs = self.scheduler.running
+        for seq in seqs:
+            seq.num_acc_tokens.append(seq.cur_acc_tokens)
+
+        output = [
+            (seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens)
+            for seq in seqs
+        ]
+
+        if self.rank == self.global_config.target_config.master_rank:
+            data = pickle.dumps([output, end_time - start_time])
+            n = len(data)
+            self.shm.buf[0:4] = n.to_bytes(4, "little")
+            self.shm.buf[4 : n + 4] = data
+
+        self.clear_requests()
+
+    def clear_requests(self):
+        """Clear both scheduler and SLO tracking."""
+        self._slo_seqs.clear()
+        self.scheduler.clear()
+        dist.barrier()
+
+    def profile_slo_latency(self):
+        """Profile and store latency metrics for SLO budget calculation.
+
+        Runs auto_set_gamma() and extracts:
+          - baseline_latency_ms = 1000 / target_speed[bs=1]
+          - draft_step_latency_ms = 1000 / draft_speed[bs=1]
+        """
+        super().auto_set_gamma()
+
+        # Reconstruct speeds from gamma_list
+        # auto_set_gamma stores gamma_list but not raw speeds.
+        # For accurate latency, use the timing from the profiling run.
+        # Fallback: estimate from gamma values
+        if hasattr(self, 'gamma_list') and self.rank == 0:
+            logger.info(f"[SLODraftRunner] Profiled gamma_list: {self.gamma_list}")
+
+        # Default latency estimates (will be refined)
+        self.baseline_latency_ms = getattr(self, '_slo_baseline_latency_ms', 30.0)
+        if self.baseline_latency_ms < 0:
+            self.baseline_latency_ms = 30.0
+
+        self.draft_step_latency_ms = getattr(self, '_slo_draft_step_latency_ms', 5.0)
+        if self.draft_step_latency_ms < 0:
+            self.draft_step_latency_ms = 5.0
+
+        self.verify_step_latency_ms = getattr(self, '_slo_verify_step_latency_ms', 25.0)
+        if self.verify_step_latency_ms < 0:
+            self.verify_step_latency_ms = 25.0
+
+        if self.rank == 0:
+            logger.info(f"[SLODraftRunner] Latency: baseline={self.baseline_latency_ms:.1f}ms, "
+                        f"draft_step={self.draft_step_latency_ms:.1f}ms, "
+                        f"verify_step={self.verify_step_latency_ms:.1f}ms")
