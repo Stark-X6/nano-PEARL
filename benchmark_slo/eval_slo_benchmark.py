@@ -67,12 +67,23 @@ def parse_args():
     return parser.parse_args()
 
 
+def cleanup_stale_shm():
+    """Remove stale shared memory segments from previous runs."""
+    import glob
+    for path in glob.glob("/dev/shm/*group*"):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def generate_random_inputs(num_samples, input_len, seed=0):
     rng = random.Random(seed)
     return [[rng.randint(0, 10000) for _ in range(input_len)] for _ in range(num_samples)]
 
 
 def run_original_pearl(config, inputs, sampling_params, bs, num_pearl_steps):
+    cleanup_stale_shm()
     """Run original PEARL with uniform gamma as baseline."""
     logger.info("=" * 60)
     logger.info("Running Original PEARL (uniform gamma)")
@@ -123,6 +134,7 @@ def run_original_pearl(config, inputs, sampling_params, bs, num_pearl_steps):
 def run_slo_pearl(slo_config, inputs, sampling_params, bs, num_pearl_steps,
                   slo_ratios_dist, seed):
     """Run SLO-PEARL with per-seq gamma."""
+    cleanup_stale_shm()
     logger.info("=" * 60)
     logger.info("Running SLO-PEARL (per-seq gamma)")
     logger.info("=" * 60)
