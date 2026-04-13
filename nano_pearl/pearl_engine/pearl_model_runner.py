@@ -20,6 +20,11 @@ from nano_pearl.pearl_engine.sequence import SequenceStatus
 from transformers import AutoTokenizer
 from tqdm import trange
 
+import os
+import sys
+import traceback
+
+
 
 class ModelRunnerBase:
     """
@@ -78,6 +83,153 @@ class ModelRunnerBase:
         dist.barrier()
         if self.rank == 0:
             logger.info("initialized dist.", color="blue")
+
+    def init_dist(self):
+        import os
+        import sys
+        import traceback
+        from datetime import timedelta
+
+        import torch
+        import torch.distributed as dist
+
+        rank = self.rank
+        pid = os.getpid()
+        world_size = self.global_config.world_size
+        current_device = torch.device(f"cuda:{rank}")
+
+        def _log(msg: str):
+            print(f"[Rank {rank} pid={pid}] {msg}", flush=True)
+
+        try:
+            # ------------------------------------------------------------------
+            # 0) Sanitize debug env in child processes
+            # DETAIL wraps PGs with extra Gloo-based checking and can hang on init.
+            # Keep INFO/OFF only.
+            # ------------------------------------------------------------------
+            dbg = os.environ.get("TORCH_DISTRIBUTED_DEBUG", "").upper()
+            if dbg == "DETAIL":
+                _log("TORCH_DISTRIBUTED_DEBUG=DETAIL detected; downgrading to INFO for subgroup init")
+                os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
+
+            # Migrate deprecated env if the caller still exports the old one.
+            if "NCCL_ASYNC_ERROR_HANDLING" in os.environ and "TORCH_NCCL_ASYNC_ERROR_HANDLING" not in os.environ:
+                os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = os.environ["NCCL_ASYNC_ERROR_HANDLING"]
+
+            torch.cuda.set_device(rank)
+
+            # ------------------------------------------------------------------
+            # 1) Default/world process group
+            # ------------------------------------------------------------------
+            _log("before init_process_group")
+            dist.init_process_group(
+                backend="nccl",
+                init_method="tcp://localhost:2333",
+                world_size=world_size,
+                rank=rank,
+                device_id=current_device,
+                timeout=timedelta(minutes=10),
+            )
+            _log("after init_process_group")
+
+            # ------------------------------------------------------------------
+            # 2) draft subgroup
+            # All world ranks must call new_group() in the same global order.
+            # ------------------------------------------------------------------
+            draft_ranks = self.global_config.draft_config.devices
+            _log(f"about to create draft_group, ranks={draft_ranks}")
+            draft_group = dist.new_group(
+                ranks=draft_ranks,
+                backend="nccl",
+                device_id=current_device,
+                timeout=timedelta(minutes=10),
+            )
+            _log("draft_group created")
+
+            # ------------------------------------------------------------------
+            # 3) target subgroup
+            # ------------------------------------------------------------------
+            target_ranks = self.global_config.target_config.devices
+            _log(f"about to create target_group, ranks={target_ranks}")
+            target_group = dist.new_group(
+                ranks=target_ranks,
+                backend="nccl",
+                device_id=current_device,
+                timeout=timedelta(minutes=10),
+            )
+            _log("target_group created")
+
+            # ------------------------------------------------------------------
+            # 4) verify group
+            # Reuse WORLD if verify ranks == all world ranks.
+            # For tp=3 with draft=[0], target=[1,2,3], this is exactly WORLD.
+            # ------------------------------------------------------------------
+            verify_ranks = [self.global_config.draft_config.master_rank] + target_ranks
+            world_ranks = list(range(world_size))
+            if verify_ranks == world_ranks:
+                verify_group = dist.group.WORLD
+                _log("verify_group reuses WORLD")
+            else:
+                _log(f"about to create verify_group, ranks={verify_ranks}")
+                verify_group = dist.new_group(
+                    ranks=verify_ranks,
+                    backend="nccl",
+                    device_id=current_device,
+                    timeout=timedelta(minutes=10),
+                )
+                _log("verify_group created")
+
+            # ------------------------------------------------------------------
+            # 5) assign groups
+            # ------------------------------------------------------------------
+            self.group = draft_group if self.is_draft else target_group
+            self.verify_group = verify_group
+
+            self.tp_params = TPParams(
+                rank=self.rank,
+                group=self.group,
+                group_name=self.group_name,
+                local_rank=(
+                    self.rank
+                    if self.is_draft
+                    else self.rank - self.global_config.draft_config.tensor_parallel_size
+                ),
+                master_rank=self.group_config.master_rank,
+                is_draft=self.is_draft,
+                tp_size=self.tensor_parallel_size,
+                valid_vocab_size=getattr(
+                    self.hf_config,
+                    "valid_vocab_size",
+                    self.hf_config.vocab_size,
+                ),
+            )
+            _log(
+                f"tp_params ready: group_name={self.group_name}, "
+                f"local_rank={self.tp_params.local_rank}, "
+                f"master_rank={self.tp_params.master_rank}, "
+                f"tp_size={self.tp_params.tp_size}"
+            )
+
+            # ------------------------------------------------------------------
+            # 6) world barrier after subgroup creation
+            # Explicit device_ids avoids NCCL guessing warnings.
+            # ------------------------------------------------------------------
+            _log("about to world barrier after group creation")
+            dist.barrier(device_ids=[rank])
+            _log("passed world barrier after group creation")
+
+            if self.rank == 0:
+                logger.info("initialized dist.", color="blue")
+
+        except Exception as e:
+            print(
+                f"\n[Rank {rank} pid={pid}] EXCEPTION in init_dist: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exc()
+            raise
         
     def init_shared_memory(self):
         """
