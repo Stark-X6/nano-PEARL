@@ -324,3 +324,144 @@ class SLOTargetRunner(ModelRunnerBase):
         self._slo_seqs.clear()
         self.scheduler.clear()
         dist.barrier()
+
+    # === Double Buffering Logic: New Functions Added for Step 2 ===
+
+    def verify_double_buffer_recv_and_run(self, seqs):
+        """
+        [Double Buffering] 接收来自 Draft 的草稿数据并执行 Target 验证计算。
+        逐行解释：
+        1. 接收 Gamma Map (Broadcast 1)。
+        2. 根据 Gamma Map 接收待验证的 Tokens (Broadcast 2)。
+        3. 准备 Target 模型的输入 (slot_mapping 等)。
+        4. 执行 Target 模型前向传播计算 Logits。
+        """
+        num_seqs = len(seqs)
+        # 阻塞点 1: 接收每个序列的验证深度 (gamma)
+        gamma_tensor = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
+        dist.broadcast(gamma_tensor, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        gamma_map = {seq.seq_id: int(g) for seq, g in zip(seqs, gamma_tensor.tolist())}
+        self._current_gamma_map = gamma_map
+
+        # 计算待接收的消息总长度
+        num_to_be_verified_tokens = sum(1 if seq.pre_verify else gamma_map.get(seq.seq_id, 1) for seq in seqs)
+        num_next_round_input = sum(gamma_map.get(seq.seq_id, 1) for seq in seqs)
+
+        # 阻塞点 2: 接收待验证 token 和下轮起草输入
+        msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input, dtype=torch.int64, device="cuda")
+        dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+
+        # 准备模型推理
+        input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs, gamma_map)
+        temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
+        
+        # 执行 Target 模型推理 (这是最耗时的步骤，此时 Draft 正在起草另一个 Batch)
+        logits = self.run_model(input_ids, positions, False)
+        
+        return logits, msg, num_to_be_verified_tokens, next_round_input_list, temperatures, gamma_map
+
+    def verify_double_buffer_send(self, logits, seqs, temperatures, gamma_map, msg, num_to_be_verified_tokens):
+        """
+        [Double Buffering] 执行验证判定、更新本地状态并将结果广播回 Draft。
+        """
+        to_be_verified_tokens = msg[:num_to_be_verified_tokens].tolist()
+        next_round_input = msg[num_to_be_verified_tokens:].tolist()
+        
+        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+
+        if self.tp_params.local_rank == 0:
+            # 1. 判定接受率
+            r = torch.rand(num_to_be_verified_tokens, device="cuda")
+            target_logits = norm_logits(logits, temperatures)
+            target_prob = target_logits.gather(dim=1, index=msg[:num_to_be_verified_tokens].unsqueeze(1)).squeeze(1)
+            judge = (r <= target_prob).tolist()
+
+            # 2. 采样修正 Token (Rejected Token 后的第一个 Token)
+            logits.scatter_(1, msg[:num_to_be_verified_tokens].unsqueeze(1), -float("inf"))
+            revised_tokens = self.sampler(logits, temperatures)
+
+            acc, rollout, revise_token, finish = [], [], [], []
+
+            v_idx = 0
+            for i, seq in enumerate(seqs):
+                g = gamma_map.get(seq.seq_id, 1)
+
+                if seq.pre_verify:
+                    # Case A: 预验证（只验证 1 个 token）
+                    acc.append(judge[v_idx])
+                    rollout.append(0 if judge[v_idx] else g)
+                    revise_token.append(revised_tokens[v_idx])
+
+                    if judge[v_idx]:
+                        seq.cur_acc_tokens += 1
+                        finish.append((not seq.ignore_eos and is_eos(to_be_verified_tokens[v_idx], self.scheduler.eos)) 
+                                      or seq.num_completion_tokens >= seq.max_tokens - 1)
+                    else:
+                        seq.num_acc_tokens.append(seq.cur_acc_tokens + 1)
+                        seq.cur_acc_tokens = 0
+                        finish.append((not seq.ignore_eos and is_eos(revise_token[-1], self.scheduler.eos)) 
+                                      or seq.num_completion_tokens >= seq.max_tokens - 1)
+                    v_idx += 1
+                else:
+                    # Case B: 全量验证（验证 g 个 token）
+                    finish_flag = False
+                    n = g  # 接受的 token 数量
+                    for j in range(v_idx, v_idx + g):
+                        if not seq.ignore_eos and judge[j] and is_eos(to_be_verified_tokens[j], self.scheduler.eos):
+                            finish_flag = True
+                        if not judge[j]:
+                            n = j - v_idx
+                            break
+
+                    acc.append(n == g)
+                    rollout.append(g - n)
+                    revise_token.append(revised_tokens[n + v_idx] if n < g else -1)
+                    finish.append(finish_flag or seq.num_completion_tokens >= seq.max_tokens - min(n + 1, g))
+
+                    if n == g:
+                        seq.cur_acc_tokens += n
+                    else:
+                        seq.num_acc_tokens.append(seq.cur_acc_tokens + n + 1)
+                        seq.cur_acc_tokens = 0
+                    v_idx += g
+
+            verify_res = torch.tensor([acc, rollout, revise_token, finish], dtype=torch.int64, device="cuda")
+
+        # 3. 广播验证结果给 Draft (同步点 3)
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+
+        # 4. Target 端本地同步更新序列状态与 KV Cache
+        acc_list, rollout_list, revise_token_list, finish_list = verify_res.tolist()
+        for idx, seq in enumerate(seqs):
+            g = gamma_map.get(seq.seq_id, 1)
+
+            if seq.pre_verify:
+                if acc_list[idx]:
+                    seq.pre_verify = False
+                    # 填入下一轮的起草输入
+                    start_idx = sum(gamma_map.get(s.seq_id, 1) for s in seqs[:idx])
+                    end_idx = start_idx + g
+                    for token in next_round_input[start_idx : end_idx]:
+                        seq.append_token(token)
+                else:
+                    seq.pre_verify = True
+                    seq.append_token(revise_token_list[idx])
+            else:
+                if acc_list[idx]:
+                    seq.pre_verify = False
+                    start_idx = sum(gamma_map.get(s.seq_id, 1) for s in seqs[:idx])
+                    end_idx = start_idx + g
+                    for token in next_round_input[start_idx : end_idx]:
+                        seq.append_token(token)
+                else:
+                    seq.pre_verify = True
+                    if rollout_list[idx] > 1:
+                        self.scheduler.rollback(seq, rollout_list[idx] - 1)
+                    seq.append_token(revise_token_list[idx])
+
+            if finish_list[idx]:
+                seq.status = SequenceStatus.FINISHED
+                seq.num_acc_tokens.append(seq.cur_acc_tokens)
+                self.scheduler.block_manager.deallocate(seq)
+                self.scheduler.running.remove(seq)
+                self.scheduler.finished.append(seq)
