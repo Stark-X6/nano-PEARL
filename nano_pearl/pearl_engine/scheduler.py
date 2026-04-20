@@ -66,6 +66,19 @@ class Scheduler:
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
+    def schedule_double_buffer(self) -> tuple[list[Sequence], list[Sequence]]:
+        """
+        [Double Buffering] Split running requests into two batches.
+        """
+        running_list = list(self.running)
+
+        mid = len(running_list) // 2
+
+        batch_0 = running_list[:mid]
+        batch_1 = running_list[mid:]
+
+        return batch_0, batch_1
+
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
