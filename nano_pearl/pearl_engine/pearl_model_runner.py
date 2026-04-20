@@ -55,36 +55,10 @@ class ModelRunnerBase:
         
     def init_dist(self):
         """
-        We use a global process group to initialize the dist.
-        Create 3 sub-groups for the draft and target group and verify group.
+        Initialize the distributed environment with enhanced error handling and NCCL stability optimizations.
+        This includes sanitizing environment variables, setting explicit timeouts, and managing process groups
+        to prevent common initialization hangs and NCCL errors.
         """
-        dist.init_process_group("nccl", 
-                                f"tcp://localhost:2333", 
-                                world_size=self.global_config.world_size,
-                                rank=self.rank,
-                                device_id=torch.device(f"cuda:{self.rank}"))
-        draft_group = dist.new_group(self.global_config.draft_config.devices)
-        target_group = dist.new_group(self.global_config.target_config.devices)
-        verify_group = dist.new_group([self.global_config.draft_config.master_rank] + self.global_config.target_config.devices )
-        self.group = draft_group if self.is_draft else target_group
-        self.verify_group = verify_group
-
-        # IMPORTANT: tp_params is used to specify the TP settings everywhere.
-        self.tp_params = TPParams(
-            rank=self.rank,
-            group=self.group,
-            group_name=self.group_name,
-            local_rank=self.rank if self.is_draft else self.rank - self.global_config.draft_config.tensor_parallel_size,
-            master_rank=self.group_config.master_rank,
-            is_draft=self.is_draft,
-            tp_size=self.tensor_parallel_size,
-            valid_vocab_size= getattr(self.hf_config, "valid_vocab_size", self.hf_config.vocab_size)
-        )
-        dist.barrier()
-        if self.rank == 0:
-            logger.info("initialized dist.", color="blue")
-
-    def init_dist(self):
         import os
         import sys
         import traceback
@@ -217,6 +191,9 @@ class ModelRunnerBase:
             _log("about to world barrier after group creation")
             dist.barrier(device_ids=[rank])
             _log("passed world barrier after group creation")
+
+            if self.rank == 0:
+                logger.info("initialized dist.", color="blue")
 
             if self.rank == 0:
                 logger.info("initialized dist.", color="blue")
