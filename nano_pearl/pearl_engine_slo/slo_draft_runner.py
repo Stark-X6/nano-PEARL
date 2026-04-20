@@ -397,3 +397,146 @@ class SLODraftRunner(ModelRunnerBase):
             logger.info(f"[SLODraftRunner] Latency: baseline={self.baseline_latency_ms:.1f}ms, "
                         f"draft_step={self.draft_step_latency_ms:.1f}ms, "
                         f"verify_step={self.verify_step_latency_ms:.1f}ms")
+
+    # === Double Buffering Logic: New Functions Added for Step 2 ===
+    def draft_batch_double_buffer(self, seqs):
+        """
+        [Double Buffering] 仅执行起草逻辑，不进行通信。
+        该函数对应“先起草再剪枝”策略中的“全量起草”阶段。
+        """
+        draft_logits_steps = []
+        draft_token_ids_steps = []
+
+        # 无论 SLO 如何，先统一为 batch 内所有请求起草 max_gamma 步
+        for step in range(self.max_gamma):
+            input_ids, positions = self.prepare_pearl_decode(seqs)
+            logits = self.run_model(input_ids, positions, False)
+            
+            # 克隆 logits 以便后续 slo_scheduler 计算每个 token 的接受概率
+            draft_logits_steps.append(logits.clone())
+            
+            # 执行起草采样（通常为 Greedy）
+            sample_tokens = (logits.argmax(dim=-1) if self.tp_params.local_rank == 0 
+                            else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True))
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            token_ids = sample_tokens.tolist()
+            draft_token_ids_steps.append(token_ids)
+            reset_context(self.tp_params)
+            
+            # 将起草的 token 临时附加到序列对象中
+            for seq, token_id in zip(seqs, token_ids):
+                seq.append_token(token_id)
+        
+        return draft_logits_steps, draft_token_ids_steps
+
+    def verify_double_buffer_send(self, seqs, draft_logits_steps, draft_token_ids_steps):
+        """
+        [Double Buffering] 执行剪枝计算，并将验证数据发送给 Target。
+        该函数实现了“先起草再剪枝”策略中的“根据 SLO 分配并回滚”以及“变长验证数据外发”。
+        """
+        slo_seqs = self._get_slo_seqs(seqs)
+        
+        # 计算每个 token 在 draft 模型下的累积概率
+        per_seq_token_infos = self.slo_scheduler.compute_draft_token_probs(
+            draft_logits_steps, draft_token_ids_steps
+        )
+        
+        # 使用第一步实现的 SLO 分配算法计算每个序列专属的 gamma
+        total_budget = self._slo_total_budget if self._slo_total_budget > 0 else self.max_gamma * len(seqs)
+        
+        # Get latency estimates (use profiled values or defaults)
+        baseline_ms = getattr(self, 'baseline_latency_ms', 30.0)
+        draft_step_ms = getattr(self, 'draft_step_latency_ms', 5.0)
+        verify_step_ms = getattr(self, 'verify_step_latency_ms', 25.0)
+        # batch_latency_ms scales with batch size (approximation)
+        batch_ms = verify_step_ms * max(1.0, len(seqs) / 8.0)
+
+        # Allocate budget
+        gamma_map = self.slo_scheduler.allocate_budget(
+            slo_seqs, total_budget, baseline_ms,
+            draft_step_ms, verify_step_ms, batch_ms,
+            per_seq_token_infos,
+        )
+
+        # Store gamma_map for verify
+        self._current_gamma_map = gamma_map
+
+        # Update SLOSequence assigned_gamma
+        for slo_seq in slo_seqs:
+            slo_seq.assigned_gamma = gamma_map.get(slo_seq.seq_id, 1)
+
+        # 执行“剪枝”：根据 gamma_map 回滚超出分配深度的多余 Token
+        for seq in seqs:
+            g = gamma_map.get(seq.seq_id, 1)
+            excess = self.max_gamma - g
+            if excess > 0:
+                self.scheduler.rollback(seq, excess)
+
+        # 按照“两次广播协议”发送数据到 Target
+        if self.tp_params.local_rank == 0:
+            to_be_verified_tokens = []
+            next_round_input = []
+            for seq in seqs:
+                g = gamma_map.get(seq.seq_id, 1)
+                if seq.pre_verify:
+                    to_be_verified_tokens.append(seq.token_ids[-g])
+                else:
+                    to_be_verified_tokens.extend(seq.token_ids[-2 * g + 1 : -g + 1])
+                next_round_input.extend(seq.token_ids[-g:])
+
+            # 广播 1: 发送每个请求不同的 gamma 值
+            gamma_tensor = torch.tensor([gamma_map.get(s.seq_id, 1) for s in seqs], dtype=torch.int64, device="cuda")
+            dist.broadcast(gamma_tensor, src=self.rank, group=self.verify_group)
+        
+            # 广播 2: 发送待验证的 token 序列
+            msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
+            dist.broadcast(msg, src=self.rank, group=self.verify_group)
+        else:
+            # 辅助 Rank 配合 NCCL 同步点
+            gamma_tensor = torch.zeros(len(seqs), dtype=torch.int64, device="cuda")
+            dist.broadcast(gamma_tensor, src=self.tp_params.master_rank, group=self.verify_group)
+            total_gamma = gamma_tensor.sum().item()
+            num_to_verify = sum(1 if seq.pre_verify else gamma_map.get(seq.seq_id, 1) - 1 for seq in seqs)
+            msg = torch.zeros(int(num_to_verify + total_gamma), dtype=torch.int64, device="cuda")
+            dist.broadcast(msg, src=self.tp_params.master_rank, group=self.verify_group)
+        
+        return gamma_map
+
+    def verify_double_buffer_recv(self, seqs, gamma_map):
+        """
+        [Double Buffering] 接收验证结果。
+        此函数通常在下一个 Batch 起草完成后调用，从而实现计算重叠。
+        """
+        num_seqs = len(seqs)
+        verify_res = torch.zeros((4, num_seqs), dtype=torch.int64, device="cuda")
+        
+        # 阻塞在此，直到 Target 模型完成验证并广播结果
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+
+        # 根据验证结果（acc/rollout/finish等）更新本地序列状态
+        acc, rollout, revise_token, finish = verify_res.tolist()
+        for idx, seq in enumerate(seqs):
+            g = gamma_map.get(seq.seq_id, 1)
+            if finish[idx]:
+                seq.status = SequenceStatus.FINISHED
+                self.scheduler.block_manager.deallocate(seq)
+                self.scheduler.running.remove(seq)
+                self.scheduler.finished.append(seq)
+                continue
+
+            if seq.pre_verify:
+                if acc[idx]:
+                    seq.pre_verify = False
+                else:
+                    seq.pre_verify = True
+                    self.scheduler.rollback(seq, g)
+                    seq.append_token(revise_token[idx])
+            else:
+                if acc[idx]:
+                    seq.pre_verify = False
+                else:
+                    seq.pre_verify = True
+                    self.scheduler.rollback(seq, g)
+                    if rollout[idx] > 1:
+                        self.scheduler.rollback(seq, rollout[idx] - 1)
+                    seq.append_token(revise_token[idx])
