@@ -283,3 +283,66 @@ class SLOPearlEngine:
         self.controller.target_shm.close()
         self.controller.draft_shm.unlink()
         self.controller.target_shm.unlink()
+
+    def slo_generate_double_buffer(self):
+        """
+        [Double Buffering] 运行双缓冲 SLO 感知投机采样推理。
+        逐行解释：
+        1. 向控制器发送指令，让 Draft 和 Target 运行对应的 _double_buffer 函数。
+        2. 等待控制事件信号（由 Rank 0 在完成任务后设置）。
+        3. 从共享内存读取生成结果和总耗时。
+        4. 对结果进行排序、解码，并计算 SLO 指标。
+        """
+        # 通过共享内存命令字触发 Runner 执行新函数
+        self.controller.write_draft_shm("slo_generate_double_buffer")
+        self.controller.write_target_shm("slo_generate_double_buffer")
+         
+        # 阻塞等待子进程完成
+        self.control_event.wait()
+        self.control_event.clear()
+
+        # 读取并解析输出
+        output, elapsed_time = self.controller.read_output()
+        output = sorted(output, key=lambda x: x[0])
+        seq_id, token_ids, num_acc_tokens = zip(*output)
+         
+        # 解码 Token 为文本
+        output_text = [
+            self.tokenizer.decode(tids, skip_special_tokens=False)
+            for tids in token_ids
+        ]
+        num_tokens = [len(t) for t in token_ids]
+
+        # 调用现有的 _compute_metrics 计算 SLO 达标率等实验数据
+        slo_metrics = self._compute_metrics(
+            output, elapsed_time, num_tokens, num_acc_tokens
+        )
+
+        return output_text, num_tokens, num_acc_tokens, elapsed_time, slo_metrics
+
+    def slo_bench_generate_double_buffer(self, num_pearl_steps=100):
+        """
+        [Double Buffering] 用于 Benchmark 的双缓冲函数。
+        """
+        # 发送带参数的指令（指定运行步数）
+        self.controller.write_draft_shm("slo_bench_generate_double_buffer", num_pearl_steps)
+        self.controller.write_target_shm("slo_bench_generate_double_buffer", num_pearl_steps)
+        
+        self.control_event.wait()
+        self.control_event.clear()
+
+        output, elapsed_time = self.controller.read_output()
+        output = sorted(output, key=lambda x: x[0])
+        seq_id, token_ids, num_acc_tokens = zip(*output)
+         
+        output_text = [
+            self.tokenizer.decode(tids, skip_special_tokens=False)
+            for tids in token_ids
+        ]
+        num_tokens = [len(t) for t in token_ids]
+
+        slo_metrics = self._compute_metrics(
+            output, elapsed_time, num_tokens, num_acc_tokens
+        )
+
+        return output_text, num_tokens, num_acc_tokens, elapsed_time, slo_metrics
