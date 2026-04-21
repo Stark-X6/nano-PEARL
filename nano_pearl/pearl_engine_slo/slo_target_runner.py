@@ -465,3 +465,37 @@ class SLOTargetRunner(ModelRunnerBase):
                 self.scheduler.block_manager.deallocate(seq)
                 self.scheduler.running.remove(seq)
                 self.scheduler.finished.append(seq)
+
+    def slo_generate_double_buffer(self):
+        """
+        [Double Buffering] Target 端流水线主循环。
+        """
+        dist.barrier()
+        torch.cuda.synchronize()
+        self.prefill()
+
+        # 获取相同的初始 Batch 划分
+        batch_0, batch_1 = self.scheduler.schedule_double_buffer()
+
+        if not batch_0 or not batch_1:
+            while not self.scheduler.is_finished():
+                self.pearl_step()
+            self.clear_requests()
+            return
+
+        # 初始指针对齐
+        curr_target_batch = batch_0
+        next_target_batch = batch_1
+
+        while not self.scheduler.is_finished():
+            # A. 接收并计算：阻塞等待 Draft 发起 Batch X 的验证
+            logits, msg, num_v, temps, g_map = self.verify_double_buffer_recv_and_run(curr_target_batch)
+
+            # B. 判定并发送：将结果返回给 Draft (同步点)
+            # 在执行此步时，Draft 可能已经起草完了 Batch Y
+            self.verify_double_buffer_send(logits, curr_target_batch, temps, g_map, msg, num_v)
+
+            # C. 轮换 Batch
+            curr_target_batch, next_target_batch = next_target_batch, curr_target_batch
+
+        self.clear_requests()

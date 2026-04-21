@@ -540,3 +540,75 @@ class SLODraftRunner(ModelRunnerBase):
                     if rollout[idx] > 1:
                         self.scheduler.rollback(seq, rollout[idx] - 1)
                     seq.append_token(revise_token[idx])
+
+    def slo_generate_double_buffer(self):
+        """
+        [Double Buffering] Draft 端流水线主循环。
+        实现：Prime Batch 0 -> Loop (Draft B1 & RecvVerify B0)
+        """
+        dist.barrier()
+        torch.cuda.synchronize()
+        
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
+        import time as _time
+        start_time.record()
+        wall_start = _time.time()
+        
+        # 0. 准备工作：同步执行 Prefill
+        self.prefill()
+
+        # 1. 划分初始 Batch (通过 Phase 1 实现的函数)
+        batch_0, batch_1 = self.scheduler.schedule_double_buffer()
+
+        # 安全回退：如果请求太少无法分两批，退回到单批次模式
+        if not batch_0 or not batch_1:
+            while not self.scheduler.is_finished():
+                self.pearl_step() # 调用原有的同步 pearl_step
+            end_time.record()
+            torch.cuda.synchronize()
+            self._write_output_to_shm(wall_start)
+            self.clear_requests()
+            return
+
+        # 2. Prime 阶段：起草 Batch 0 并外发验证数据
+        logits_0, ids_0 = self.draft_batch_double_buffer(batch_0)
+        g_map_0 = self.verify_double_buffer_send(batch_0, logits_0, ids_0)
+
+        # 初始状态指针
+        curr_draft_batch = batch_1
+        curr_verify_batch = batch_0
+        curr_verify_g_map = g_map_0
+
+        # 3. Loop 阶段：核心流水线
+        while not self.scheduler.is_finished():
+            # A. 并行点：起草下一批 (此时 Target 正在并行验证上一批)
+            l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
+
+            # B. 同步点：等待并接收上一批的验证结果
+            # 如果此时验证还没完，Draft 会阻塞在此处
+            self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
+
+            # C. 发送点：将刚刚起草完的数据发给 Target
+            g_map_next = self.verify_double_buffer_send(curr_draft_batch, l_next, i_next)
+
+            # D. 指针交换：轮换 Batch
+            curr_draft_batch, curr_verify_batch = curr_verify_batch, curr_draft_batch
+            curr_verify_g_map = g_map_next
+
+        # 4. 结果输出
+        end_time.record()
+        torch.cuda.synchronize()
+        self._write_output_to_shm(wall_start)
+        self.clear_requests()
+
+    def _write_output_to_shm(self, wall_start):
+        """辅助函数：将生成结果写入共享内存 (不修改原有逻辑，仅封装)"""
+        wall_end = time.time()
+        seqs = self.scheduler.finished
+        output = [(s.seq_id, s.completion_token_ids, s.num_acc_tokens) for s in seqs]
+        if self.rank == self.global_config.target_config.master_rank:
+            data = pickle.dumps([output, wall_end - wall_start])
+            n = len(data)
+            self.shm.buf[0:4] = n.to_bytes(4, "little")
+            self.shm.buf[4 : n + 4] = data
