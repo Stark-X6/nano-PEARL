@@ -472,6 +472,9 @@ class SLOTargetRunner(ModelRunnerBase):
         """
         dist.barrier()
         torch.cuda.synchronize()
+        import time as _time
+        wall_start = _time.time()
+
         self.prefill()
 
         # 获取相同的初始 Batch 划分
@@ -480,6 +483,9 @@ class SLOTargetRunner(ModelRunnerBase):
         if not batch_0 or not batch_1:
             while not self.scheduler.is_finished():
                 self.pearl_step()
+            torch.cuda.synchronize()
+            wall_end = _time.time()
+            self._write_output_to_shm(wall_start, wall_end)
             self.clear_requests()
             return
 
@@ -498,4 +504,60 @@ class SLOTargetRunner(ModelRunnerBase):
             # C. 轮换 Batch
             curr_target_batch, next_target_batch = next_target_batch, curr_target_batch
 
+        torch.cuda.synchronize()
+        wall_end = _time.time()
+        self._write_output_to_shm(wall_start, wall_end)
         self.clear_requests()
+
+    def slo_bench_generate_double_buffer(self, num_pearl_steps=100):
+        """
+        [Double Buffering] 用于 Benchmark 的 Target 端主循环。
+        """
+        dist.barrier()
+        torch.cuda.synchronize()
+        import time as _time
+        start_time = _time.time()
+
+        self.prefill()
+
+        # 同样设置忽略 EOS
+        for seq in self.scheduler.running:
+            seq.max_tokens = int(1e8)
+            seq.ignore_eos = True
+
+        batch_0, batch_1 = self.scheduler.schedule_double_buffer()
+
+        if not batch_0 or not batch_1:
+            for _ in range(num_pearl_steps):
+                self.pearl_step()
+            torch.cuda.synchronize()
+            end_time = _time.time()
+            self._write_output_to_shm(start_time, end_time)
+            self.clear_requests()
+            return
+
+        curr_target_batch = batch_0
+        next_target_batch = batch_1
+
+        # 这里的步数必须与 Draft 严格对齐 (num_pearl_steps + 1 轮)
+        # 因为 Draft 在 Prime 阶段多发了一个 batch，在最后需要多收一个 batch。
+        # 实际代码中，Draft 跑了 num_pearl_steps 次 Loop，总共发了 num_pearl_steps + 1 个验证请求。
+        for _ in range(num_pearl_steps + 1):
+            logits, msg, num_v, temps, g_map = self.verify_double_buffer_recv_and_run(curr_target_batch)
+            self.verify_double_buffer_send(logits, curr_target_batch, temps, g_map, msg, num_v)
+            curr_target_batch, next_target_batch = next_target_batch, curr_target_batch
+
+        torch.cuda.synchronize()
+        end_time = _time.time()
+        self._write_output_to_shm(start_time, end_time)
+        self.clear_requests()
+
+    def _write_output_to_shm(self, wall_start, wall_end):
+        """辅助函数：将生成结果写入共享内存 (不修改原有逻辑，仅封装)"""
+        seqs = self.scheduler.finished
+        output = [(s.seq_id, s.completion_token_ids, s.num_acc_tokens) for s in seqs]
+        if self.rank == self.global_config.target_config.master_rank:
+            data = pickle.dumps([output, wall_end - wall_start])
+            n = len(data)
+            self.shm.buf[0:4] = n.to_bytes(4, "little")
+            self.shm.buf[4 : n + 4] = data

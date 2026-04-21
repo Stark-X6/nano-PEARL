@@ -567,7 +567,8 @@ class SLODraftRunner(ModelRunnerBase):
                 self.pearl_step() # 调用原有的同步 pearl_step
             end_time.record()
             torch.cuda.synchronize()
-            self._write_output_to_shm(wall_start)
+            wall_end = _time.time()
+            self._write_output_to_shm(wall_start, wall_end)
             self.clear_requests()
             return
 
@@ -599,12 +600,81 @@ class SLODraftRunner(ModelRunnerBase):
         # 4. 结果输出
         end_time.record()
         torch.cuda.synchronize()
-        self._write_output_to_shm(wall_start)
+        wall_end = _time.time()
+        self._write_output_to_shm(wall_start, wall_end)
         self.clear_requests()
 
-    def _write_output_to_shm(self, wall_start):
+    def slo_bench_generate_double_buffer(self, num_pearl_steps=100):
+        """
+        [Double Buffering] 用于 Benchmark 的 Draft 端主循环。
+        逐行解释：
+        1. 初始化计时器。
+        2. 同步执行 Prefill。
+        3. 强制设置所有序列不因 EOS 停止，并记录解码开始时间。
+        4. 划分 Batch。
+        5. Prime 阶段：起草 Batch 0。
+        6. 循环执行 num_pearl_steps 步，实现计算重叠。
+        """
+        dist.barrier()
+        torch.cuda.synchronize()
+        import time as _time
+        start_time = _time.time()
+
+        self.prefill()
+
+        # Benchmark 特有设置：忽略 EOS，记录开始时间
+        for seq in self.scheduler.running:
+            seq.max_tokens = int(1e8)
+            seq.ignore_eos = True
+            if seq.seq_id in self._slo_seqs:
+                self._slo_seqs[seq.seq_id].mark_decode_start()
+
+        # 划分初始 Batch
+        batch_0, batch_1 = self.scheduler.schedule_double_buffer()
+         
+        # 如果无法分两批，退回到单批次同步模式
+        if not batch_0 or not batch_1:
+            for _ in range(num_pearl_steps):
+                self.pearl_step()
+            torch.cuda.synchronize()
+            wall_end = _time.time()
+            self._write_output_to_shm(start_time, wall_end)
+            self.clear_requests()
+            return
+
+        # Prime 阶段
+        l_0, i_0 = self.draft_batch_double_buffer(batch_0)
+        g_map_0 = self.verify_double_buffer_send(batch_0, l_0, i_0)
+
+        curr_draft_batch = batch_1
+        curr_verify_batch = batch_0
+        curr_verify_g_map = g_map_0
+
+        # Loop 阶段：固定步数循环
+        for _ in range(num_pearl_steps):
+            # A. 异步起草 (与 Target 并行)
+            l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
+            # B. 接收验证结果 (同步点)
+            self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
+            # C. 发送新验证请求
+            g_map_next = self.verify_double_buffer_send(curr_draft_batch, l_next, i_next)
+            # D. 指针轮换
+            curr_draft_batch, curr_verify_batch = curr_verify_batch, curr_draft_batch
+            curr_verify_g_map = g_map_next
+
+        # 4. 完成后收集结果
+        torch.cuda.synchronize()
+        end_time = _time.time()
+         
+        # 将最后一步的接受情况计入结果
+        for seq in self.scheduler.running:
+            seq.num_acc_tokens.append(seq.cur_acc_tokens)
+
+        self._write_output_to_shm(start_time, end_time)
+        self.clear_requests()
+
+    def _write_output_to_shm(self, wall_start, wall_end):
         """辅助函数：将生成结果写入共享内存 (不修改原有逻辑，仅封装)"""
-        wall_end = time.time()
         seqs = self.scheduler.finished
         output = [(s.seq_id, s.completion_token_ids, s.num_acc_tokens) for s in seqs]
         if self.rank == self.global_config.target_config.master_rank:
