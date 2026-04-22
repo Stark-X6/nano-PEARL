@@ -326,7 +326,7 @@ class SLOTargetRunner(ModelRunnerBase):
         dist.barrier()
 
     # === Double Buffering Logic: New Functions Added for Step 2 ===
-
+    @torch.inference_mode()
     def verify_double_buffer_recv_and_run(self, seqs):
         """
         [Double Buffering] 接收来自 Draft 的草稿数据并执行 Target 验证计算。
@@ -366,6 +366,7 @@ class SLOTargetRunner(ModelRunnerBase):
         
         return logits, msg, num_to_be_verified_tokens, temperatures, gamma_map
 
+    @torch.inference_mode()
     def verify_double_buffer_send(self, logits, seqs, temperatures, gamma_map, msg, num_to_be_verified_tokens):
         """
         [Double Buffering] 执行验证判定、更新本地状态并将结果广播回 Draft。
