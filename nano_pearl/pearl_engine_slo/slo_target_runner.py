@@ -351,6 +351,12 @@ class SLOTargetRunner(ModelRunnerBase):
         msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input, dtype=torch.int64, device="cuda")
         dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
 
+        # 【关键修正】将 Draft 刚刚起草的 Token 填入本地 Sequence，并分配显存块
+        for seq in seqs:
+            while not self.scheduler.block_manager.can_append(seq):
+                self.scheduler.preempt(self.scheduler.running[-1])
+            self.scheduler.block_manager.may_append(seq)
+
         # 准备模型推理
         input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs, gamma_map)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
@@ -358,7 +364,7 @@ class SLOTargetRunner(ModelRunnerBase):
         # 执行 Target 模型推理 (这是最耗时的步骤，此时 Draft 正在起草另一个 Batch)
         logits = self.run_model(input_ids, positions, False)
         
-        return logits, msg, num_to_be_verified_tokens, next_round_input_list, temperatures, gamma_map
+        return logits, msg, num_to_be_verified_tokens, temperatures, gamma_map
 
     def verify_double_buffer_send(self, logits, seqs, temperatures, gamma_map, msg, num_to_be_verified_tokens):
         """
@@ -439,9 +445,10 @@ class SLOTargetRunner(ModelRunnerBase):
                 if acc_list[idx]:
                     seq.pre_verify = False
                     # 填入下一轮的起草输入
-                    start_idx = sum(gamma_map.get(s.seq_id, 1) for s in seqs[:idx])
-                    end_idx = start_idx + g
-                    for token in next_round_input[start_idx : end_idx]:
+                    for token in next_round_input[
+                        sum(gamma_map.get(s.seq_id, 1) for s in seqs[:idx]) :
+                        sum(gamma_map.get(s.seq_id, 1) for s in seqs[: idx + 1])
+                    ]:
                         seq.append_token(token)
                 else:
                     seq.pre_verify = True
@@ -449,9 +456,10 @@ class SLOTargetRunner(ModelRunnerBase):
             else:
                 if acc_list[idx]:
                     seq.pre_verify = False
-                    start_idx = sum(gamma_map.get(s.seq_id, 1) for s in seqs[:idx])
-                    end_idx = start_idx + g
-                    for token in next_round_input[start_idx : end_idx]:
+                    for token in next_round_input[
+                        sum(gamma_map.get(s.seq_id, 1) for s in seqs[:idx]) :
+                        sum(gamma_map.get(s.seq_id, 1) for s in seqs[: idx + 1])
+                    ]:
                         seq.append_token(token)
                 else:
                     seq.pre_verify = True
