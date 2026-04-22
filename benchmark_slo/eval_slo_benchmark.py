@@ -170,7 +170,7 @@ def run_slo_pearl(slo_config, inputs, sampling_params, bs, num_pearl_steps,
         if getattr(slo_config, 'enable_double_buffering', False):
             logger.info("Running in Double Buffering (Step 2) Mode")
             output_text, num_tokens, num_acc_tokens, elapsed, slo_metrics = (
-                engine.slo_bench_generate_double_buffering(num_pearl_steps=num_pearl_steps)
+                engine.slo_bench_generate_double_buffer(num_pearl_steps=num_pearl_steps)
             )
         else:
             output_text, num_tokens, num_acc_tokens, elapsed, slo_metrics = (
