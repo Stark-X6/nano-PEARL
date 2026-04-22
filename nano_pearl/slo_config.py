@@ -58,6 +58,7 @@ class SLOConfig:
     #   weights should sum to 1.0. Used by emission machines.
     #   对应 AdaServe: slo_ratios in EmissionMachine
     slo_ratios: Optional[list] = None  # list[tuple[float, float]]
+    enable_double_buffering: bool = False
 
     # Latency estimates for draft and verify (auto-profiled if not set)
     # 对应 AdaServe: ssm_spec_latency_ms / max_tree_depth
@@ -100,6 +101,7 @@ class SLOConfig:
         logger.info(f"Total_Draft_Budget={self.total_draft_budget}")
         logger.info(f"Correction_Factor={self.correction_factor}")
         logger.info(f"SLO_Ratios={self.slo_ratios}")
+        logger.info(f"Enable_Double_Buffering={self.enable_double_buffering}")
         logger.info(f"Draft_Step_Latency={self.draft_step_latency_ms} ms [-1=auto]")
         logger.info(f"Verify_Step_Latency={self.verify_step_latency_ms} ms [-1=auto]")
         logger.info("=" * 50)

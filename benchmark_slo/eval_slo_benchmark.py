@@ -58,6 +58,10 @@ def parse_args():
                         help='Baseline latency in ms (-1=auto)')
     parser.add_argument('--correction-factor', type=float, default=1.0)
 
+    #Double Buffering
+    parser.add_argument('--double-buffering', action='store_true', 
+                        help='Enable double buffering for SLO-PEARL')
+
     # Other
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--warmup-iters', type=int, default=1)
@@ -163,9 +167,15 @@ def run_slo_pearl(slo_config, inputs, sampling_params, bs, num_pearl_steps,
             all_slo_ratios.append(slo_ratio)
             engine.add_request(inp, copy.deepcopy(sampling_params), slo_ratio=slo_ratio)
 
-        output_text, num_tokens, num_acc_tokens, elapsed, slo_metrics = (
-            engine.slo_bench_generate(num_pearl_steps=num_pearl_steps)
-        )
+        if getattr(slo_config, 'enable_double_buffering', False):
+            logger.info("Running in Double Buffering (Step 2) Mode")
+            output_text, num_tokens, num_acc_tokens, elapsed, slo_metrics = (
+                engine.slo_bench_generate_double_buffering(num_pearl_steps=num_pearl_steps)
+            )
+        else:
+            output_text, num_tokens, num_acc_tokens, elapsed, slo_metrics = (
+                engine.slo_bench_generate(num_pearl_steps=num_pearl_steps)
+            )
         all_num_tokens.extend(num_tokens)
         all_num_acc_tokens.extend(num_acc_tokens)
         total_time += elapsed
@@ -275,6 +285,7 @@ def main():
         baseline_latency_ms=args.baseline_latency,
         correction_factor=args.correction_factor,
         slo_ratios=slo_ratios_dist,
+        enable_double_buffering=args.double_buffering,
     )
 
     # Run original PEARL
