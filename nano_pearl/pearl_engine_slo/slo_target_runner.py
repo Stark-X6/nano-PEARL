@@ -503,13 +503,16 @@ class SLOTargetRunner(ModelRunnerBase):
         next_target_batch = batch_1
 
         while not self.scheduler.is_finished():
+            print(f"--- [Target Side] Waiting for Draft data (B1)... ---")
             # A. 接收并计算：阻塞等待 Draft 发起 Batch X 的验证
             logits, msg, num_v, temps, g_map = self.verify_double_buffer_recv_and_run(curr_target_batch)
 
+            print(f"--- [Target Side] Finished RunModel for B1. Now sending results back... ---")
             # B. 判定并发送：将结果返回给 Draft (同步点)
             # 在执行此步时，Draft 可能已经起草完了 Batch Y
             self.verify_double_buffer_send(logits, curr_target_batch, temps, g_map, msg, num_v)
 
+            print(f"--- [Target Side] Results sent for B1. Moving to next batch... ---")
             # C. 轮换 Batch
             curr_target_batch, next_target_batch = next_target_batch, curr_target_batch
 
@@ -541,7 +544,7 @@ class SLOTargetRunner(ModelRunnerBase):
                 self.pearl_step()
             torch.cuda.synchronize()
             end_time = _time.time()
-            self._write_output_to_shm(start_time, end_time)
+            self._write_output_to_shm(start_time, end_time, use_running=True)
             self.clear_requests()
             return
 
@@ -552,18 +555,21 @@ class SLOTargetRunner(ModelRunnerBase):
         # 因为 Draft 在 Prime 阶段多发了一个 batch，在最后需要多收一个 batch。
         # 实际代码中，Draft 跑了 num_pearl_steps 次 Loop，总共发了 num_pearl_steps + 1 个验证请求。
         for _ in range(num_pearl_steps + 1):
+            print(f"--- [Target Side] Waiting for Draft data (B1)... ---")
             logits, msg, num_v, temps, g_map = self.verify_double_buffer_recv_and_run(curr_target_batch)
+            print(f"--- [Target Side] Finished RunModel for B1. Now sending results back... ---")
             self.verify_double_buffer_send(logits, curr_target_batch, temps, g_map, msg, num_v)
+            print(f"--- [Target Side] Results sent for B1. Moving to next batch... ---")
             curr_target_batch, next_target_batch = next_target_batch, curr_target_batch
 
         torch.cuda.synchronize()
         end_time = _time.time()
-        self._write_output_to_shm(start_time, end_time)
+        self._write_output_to_shm(start_time, end_time, use_running=True)
         self.clear_requests()
 
-    def _write_output_to_shm(self, wall_start, wall_end):
-        """辅助函数：将生成结果写入共享内存 (不修改原有逻辑，仅封装)"""
-        seqs = self.scheduler.finished
+    #e3
+    def _write_output_to_shm(self, wall_start, wall_end, use_running=False):
+        seqs = self.scheduler.running if use_running else self.scheduler.finished
         output = [(s.seq_id, s.completion_token_ids, s.num_acc_tokens) for s in seqs]
         if self.rank == self.global_config.target_config.master_rank:
             data = pickle.dumps([output, wall_end - wall_start])

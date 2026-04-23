@@ -418,7 +418,8 @@ class SLODraftRunner(ModelRunnerBase):
             # 执行起草采样（通常为 Greedy）
             sample_tokens = (logits.argmax(dim=-1) if self.tp_params.local_rank == 0 
                             else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True))
-            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            if self.tp_params.tp_size > 1:
+                dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
             token_ids = sample_tokens.tolist()
             draft_token_ids_steps.append(token_ids)
             reset_context(self.tp_params)
@@ -583,19 +584,25 @@ class SLODraftRunner(ModelRunnerBase):
 
         # 3. Loop 阶段：核心流水线
         while not self.scheduler.is_finished():
+            print(f"--- [Draft Side] Starting Draft Loop for Batch {curr_draft_batch[0].seq_id if curr_draft_batch else 'N/A'} ---")
             # A. 并行点：起草下一批 (此时 Target 正在并行验证上一批)
             l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
 
+            print(f"--- [Draft Side] Finished Drafting B1. Now waiting for B0 verification... ---")
             # B. 同步点：等待并接收上一批的验证结果
             # 如果此时验证还没完，Draft 会阻塞在此处
             self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
 
+            print(f"--- [Draft Side] Received B0 results. Updating status... ---")
             # C. 发送点：将刚刚起草完的数据发给 Target
             g_map_next = self.verify_double_buffer_send(curr_draft_batch, l_next, i_next)
 
             # D. 指针交换：轮换 Batch
             curr_draft_batch, curr_verify_batch = curr_verify_batch, curr_draft_batch
             curr_verify_g_map = g_map_next
+
+        #e2
+        self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
 
         # 4. 结果输出
         end_time.record()
@@ -652,15 +659,23 @@ class SLODraftRunner(ModelRunnerBase):
 
         # Loop 阶段：固定步数循环
         for _ in range(num_pearl_steps):
+            print(f"--- [Draft Side] Starting Draft Loop for Batch {curr_draft_batch[0].seq_id if curr_draft_batch else 'N/A'} ---")
             # A. 异步起草 (与 Target 并行)
             l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
+
+            print(f"--- [Draft Side] Finished Drafting B1. Now waiting for B0 verification... ---")
             # B. 接收验证结果 (同步点)
             self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
+            
+            print(f"--- [Draft Side] Received B0 results. Updating status... ---")
             # C. 发送新验证请求
             g_map_next = self.verify_double_buffer_send(curr_draft_batch, l_next, i_next)
             # D. 指针轮换
             curr_draft_batch, curr_verify_batch = curr_verify_batch, curr_draft_batch
             curr_verify_g_map = g_map_next
+        
+        #e1
+        self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
 
         # 4. 完成后收集结果
         torch.cuda.synchronize()
@@ -670,12 +685,12 @@ class SLODraftRunner(ModelRunnerBase):
         for seq in self.scheduler.running:
             seq.num_acc_tokens.append(seq.cur_acc_tokens)
 
-        self._write_output_to_shm(start_time, end_time)
+        self._write_output_to_shm(start_time, end_time, use_running=True)
         self.clear_requests()
 
-    def _write_output_to_shm(self, wall_start, wall_end):
-        """辅助函数：将生成结果写入共享内存 (不修改原有逻辑，仅封装)"""
-        seqs = self.scheduler.finished
+    #e3
+    def _write_output_to_shm(self, wall_start, wall_end, use_running=False):
+        seqs = self.scheduler.running if use_running else self.scheduler.finished
         output = [(s.seq_id, s.completion_token_ids, s.num_acc_tokens) for s in seqs]
         if self.rank == self.global_config.target_config.master_rank:
             data = pickle.dumps([output, wall_end - wall_start])

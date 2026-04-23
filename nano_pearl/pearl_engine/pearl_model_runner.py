@@ -102,7 +102,7 @@ class ModelRunnerBase:
                 world_size=world_size,
                 rank=rank,
                 device_id=current_device,
-                timeout=timedelta(minutes=10),
+                timeout=timedelta(minutes=1),
             )
             _log("after init_process_group")
 
@@ -116,7 +116,7 @@ class ModelRunnerBase:
                 ranks=draft_ranks,
                 backend="nccl",
                 device_id=current_device,
-                timeout=timedelta(minutes=10),
+                timeout=timedelta(minutes=1),
             )
             _log("draft_group created")
 
@@ -129,7 +129,7 @@ class ModelRunnerBase:
                 ranks=target_ranks,
                 backend="nccl",
                 device_id=current_device,
-                timeout=timedelta(minutes=10),
+                timeout=timedelta(minutes=1),
             )
             _log("target_group created")
 
@@ -149,7 +149,7 @@ class ModelRunnerBase:
                     ranks=verify_ranks,
                     backend="nccl",
                     device_id=current_device,
-                    timeout=timedelta(minutes=10),
+                    timeout=timedelta(minutes=1),
                 )
                 _log("verify_group created")
 
