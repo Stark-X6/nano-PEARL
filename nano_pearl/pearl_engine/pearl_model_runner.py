@@ -607,8 +607,79 @@ class ModelRunnerBase:
             
         self.clear_requests()
 
+    def vllm_spec_generate(self):
+        """
+        Dedicated baseline entrypoint for uniform-gamma speculative decoding.
+        This keeps a separate command path from PEARL so the formal test
+        framework can address it as `vllm-spec`.
+        """
+        dist.barrier()
+        torch.cuda.synchronize()
+        start_time = time.time()
+        self.prefill()
+
+        if self.gamma == -1:
+            self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+
+        while not self.scheduler.is_finished():
+            self.vllm_spec_step()
+
+        torch.cuda.synchronize()
+        end_time = time.time()
+        seqs = self.scheduler.finished
+        output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
+
+        if self.rank == self.global_config.target_config.master_rank:
+            data = pickle.dumps([output, end_time - start_time])
+            n = len(data)
+            self.shm.buf[0:4] = n.to_bytes(4, "little")
+            self.shm.buf[4:n+4] = data
+
+        self.clear_requests()
+
+    def vllm_spec_bench_generate(self, num_pearl_steps: int = 100):
+        """
+        Benchmark entrypoint for the `vllm-spec` baseline.
+        Uses the same fixed-step protocol as PEARL benchmarking so all systems
+        can be compared under a unified harness.
+        """
+        dist.barrier()
+        torch.cuda.synchronize()
+        start_time = time.time()
+        self.prefill()
+
+        for seq in self.scheduler.running:
+            seq.max_tokens = 1e8
+            seq.ignore_eos = True
+        if self.gamma == -1:
+            self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+
+        for _ in range(num_pearl_steps):
+            self.vllm_spec_step()
+
+        torch.cuda.synchronize()
+        end_time = time.time()
+        seqs = self.scheduler.running
+
+        for seq in seqs:
+            seq.num_acc_tokens.append(seq.cur_acc_tokens)
+
+        output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
+
+        if self.rank == self.global_config.target_config.master_rank:
+            data = pickle.dumps([output, end_time - start_time])
+            n = len(data)
+            self.shm.buf[0:4] = n.to_bytes(4, "little")
+            self.shm.buf[4:n+4] = data
+
+        self.clear_requests()
+
     @abstractmethod
     def pearl_step(self):
+        pass
+
+    @abstractmethod
+    def vllm_spec_step(self):
         pass
 
 
@@ -637,6 +708,11 @@ class DraftModelRunner(ModelRunnerBase):
                 seq.append_token(token_id)
 
         self.verify(seqs)
+
+    def vllm_spec_step(self):
+        # Keep an explicit baseline hook instead of aliasing the PEARL path in
+        # the engine layer. This makes the formal benchmark switchboard simpler.
+        self.pearl_step()
 
     @torch.inference_mode()
     def verify(self, seqs: list[Sequence]):
@@ -724,6 +800,9 @@ class TargetModelRunner(ModelRunnerBase):
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         self.verify(logits, seqs, temperatures)
+
+    def vllm_spec_step(self):
+        self.pearl_step()
 
     @torch.inference_mode()
     def verify(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor):
