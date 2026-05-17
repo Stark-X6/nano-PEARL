@@ -15,18 +15,21 @@ Usage:
 """
 
 import argparse
-import copy
+import json
 import os
 import random
 import sys
-import time
+import tempfile
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from nano_pearl import PEARLConfig, PEARLEngine, SamplingParams, logger
-from nano_pearl.slo_config import SLOConfig
-from nano_pearl.pearl_engine_slo.slo_pearl_engine import SLOPearlEngine
-from nano_pearl.emission import RandomSLOEmission
+from benchmark_slo.run_workload import run_workload
+
+
+LEGACY_WARNING = (
+    "Legacy benchmark entrypoint: eval_slo_benchmark.py is kept only for compatibility. "
+    "Formal experiments should use exps/test.sh and benchmark_slo/run_workload.py."
+)
 
 
 def parse_args():
@@ -245,67 +248,49 @@ def print_comparison(original_metrics, slo_metrics, slo_ratios_dist):
 
 def main():
     args = parse_args()
+    print(LEGACY_WARNING, file=sys.stderr)
     random.seed(args.seed)
 
-    slo_ratios_dist = [
-        (0.6, 0.25),
-        (1.0, 0.25),
-        (1.4, 0.25),
-        (1.8, 0.25),
+    system = "slopearl" if args.double_buffering else "adaserve"
+    prompts = [f"Benchmark prompt {i}" for i in range(args.num_samples)]
+    trace = [
+        {
+            "emission_time_ms": 0.0,
+            "prompt": prompt,
+            "output_length": args.max_tokens,
+            "slo_ratio": 1.0,
+        }
+        for prompt in prompts
     ]
 
-    # Generate inputs
-    inputs = generate_random_inputs(args.num_samples, args.input_len, args.seed)
-    sampling_params = SamplingParams(
-        temperature=args.temperature,
-        ignore_eos=True,
-        max_tokens=args.max_tokens,
-    )
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tmp:
+        json.dump(trace, tmp)
+        trace_path = tmp.name
 
-    # Original PEARL config
-    pearl_config = PEARLConfig(
-        draft_model_path=args.draft_model,
-        target_model_path=args.target_model,
-        draft_tensor_parallel_size=args.draft_tp,
-        target_tensor_parallel_size=args.target_tp,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=True,
-    )
-
-    # SLO config
-    slo_config = SLOConfig(
-        draft_model_path=args.draft_model,
-        target_model_path=args.target_model,
-        draft_tensor_parallel_size=args.draft_tp,
-        target_tensor_parallel_size=args.target_tp,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=True,
-        max_gamma=args.max_gamma,
-        min_gamma=args.min_gamma,
-        baseline_latency_ms=args.baseline_latency,
-        correction_factor=args.correction_factor,
-        slo_ratios=slo_ratios_dist,
-        enable_double_buffering=args.double_buffering,
-    )
-
-    # Run original PEARL
-    original_metrics = None
-    if not args.skip_original:
-        original_metrics = run_original_pearl(
-            pearl_config, inputs, sampling_params, args.bs, args.num_pearl_steps
+    try:
+        runner_args = argparse.Namespace(
+            system=system,
+            input_file=trace_path,
+            draft_model=args.draft_model,
+            target_model=args.target_model,
+            draft_tp=args.draft_tp,
+            target_tp=args.target_tp,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_num_batched_tokens=8192,
+            max_num_seqs=args.bs,
+            temperature=args.temperature,
+            ignore_eos=True,
+            num_pearl_steps=args.num_pearl_steps,
+            baseline_latency_per_token_ms=args.baseline_latency,
+            max_gamma=args.max_gamma,
+            min_gamma=args.min_gamma,
+            correction_factor=args.correction_factor,
+            enforce_eager=True,
         )
-
-    # Run SLO-PEARL
-    slo_metrics = run_slo_pearl(
-        slo_config, inputs, sampling_params, args.bs, args.num_pearl_steps,
-        slo_ratios_dist, args.seed,
-    )
-
-    # Print comparison
-    if original_metrics:
-        print_comparison(original_metrics, slo_metrics, slo_ratios_dist)
-    else:
-        print(f"\nSLO-PEARL: throughput={slo_metrics['throughput']:.1f} tok/s, MAT={slo_metrics['mat']:.2f}")
+        result = run_workload(runner_args)
+        print(result["result_text"])
+    finally:
+        os.unlink(trace_path)
 
 
 if __name__ == "__main__":

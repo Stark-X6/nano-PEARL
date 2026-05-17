@@ -15,18 +15,22 @@ Usage:
 """
 
 import argparse
-import copy
+import json
 import os
 import random
 import sys
-import time
+import tempfile
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from nano_pearl import SamplingParams, logger
-from nano_pearl.slo_config import SLOConfig
-from nano_pearl.pearl_engine_slo.slo_pearl_engine import SLOPearlEngine
-from nano_pearl.emission import PoissonEmission, TraceEmission, RandomSLOEmission
+from benchmark_slo.generate_trace import generate_trace
+from benchmark_slo.run_workload import run_workload
+
+
+LEGACY_WARNING = (
+    "Legacy benchmark entrypoint: eval_slo_trace.py is kept only for compatibility. "
+    "Formal experiments should use exps/test.sh and benchmark_slo/run_workload.py."
+)
 
 
 def parse_args():
@@ -171,46 +175,51 @@ def print_trace_report(results, slo_groups, slo_ratios_dist):
 
 def main():
     args = parse_args()
+    print(LEGACY_WARNING, file=sys.stderr)
     random.seed(args.seed)
-
-    slo_ratios_dist = [
-        (0.6, 0.25),
-        (1.0, 0.25),
-        (1.4, 0.25),
-        (1.8, 0.25),
-    ]
-
-    inputs = generate_random_inputs(args.num_requests, args.input_len, args.seed)
-    sampling_params = SamplingParams(
-        temperature=args.temperature,
-        ignore_eos=True,
-        max_tokens=args.max_tokens,
-    )
-
-    slo_config = SLOConfig(
-        draft_model_path=args.draft_model,
-        target_model_path=args.target_model,
-        draft_tensor_parallel_size=args.draft_tp,
-        target_tensor_parallel_size=args.target_tp,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=True,
-        max_gamma=args.max_gamma,
-        min_gamma=args.min_gamma,
-        baseline_latency_ms=args.baseline_latency,
-        correction_factor=args.correction_factor,
-        slo_ratios=slo_ratios_dist,
-    )
-
     if args.trace:
-        emission = TraceEmission(trace_path=args.trace, slo_ratios=slo_ratios_dist, seed=args.seed)
+        trace_path = args.trace
+        cleanup_path = None
     else:
-        emission = PoissonEmission(req_per_s=args.rps, slo_ratios=slo_ratios_dist, seed=args.seed)
+        prompts = [f"Trace prompt {i}" for i in range(args.num_requests)]
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        tmp.close()
+        generate_trace(
+            tmp.name,
+            num_requests=args.num_requests,
+            rps=args.rps,
+            output_length=args.max_tokens,
+            prompts=prompts,
+            seed=args.seed,
+        )
+        trace_path = tmp.name
+        cleanup_path = tmp.name
 
-    results, slo_groups = run_trace_benchmark(
-        slo_config, inputs, sampling_params, emission, slo_ratios_dist
-    )
-
-    print_trace_report(results, slo_groups, slo_ratios_dist)
+    try:
+        runner_args = argparse.Namespace(
+            system="adaserve",
+            input_file=trace_path,
+            draft_model=args.draft_model,
+            target_model=args.target_model,
+            draft_tp=args.draft_tp,
+            target_tp=args.target_tp,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_num_batched_tokens=8192,
+            max_num_seqs=128,
+            temperature=args.temperature,
+            ignore_eos=True,
+            num_pearl_steps=100,
+            baseline_latency_per_token_ms=args.baseline_latency,
+            max_gamma=args.max_gamma,
+            min_gamma=args.min_gamma,
+            correction_factor=args.correction_factor,
+            enforce_eager=True,
+        )
+        result = run_workload(runner_args)
+        print(result["result_text"])
+    finally:
+        if cleanup_path is not None:
+            os.unlink(cleanup_path)
 
 
 if __name__ == "__main__":
