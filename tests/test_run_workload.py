@@ -53,7 +53,11 @@ class RunWorkloadFormattingTests(unittest.TestCase):
 
         records = build_request_records(
             workload=workload,
-            num_tokens=[20, 10],
+            raw_output=[
+                (0, [1] * 20, [1]),
+                (1, [2] * 10, [1]),
+            ],
+            seq_id_to_request_id={0: 0, 1: 1},
             total_run_time_s=0.4,
             baseline_latency_per_token_ms=30.0,
         )
@@ -93,12 +97,19 @@ class RunWorkloadFormattingTests(unittest.TestCase):
             def __init__(self):
                 self.requests = []
                 self.exited = False
+                self.next_seq_id = 10
 
             def add_request(self, prompt, sampling_params, slo_ratio):
-                self.requests.append((prompt, sampling_params.max_tokens, slo_ratio))
+                seq_id = self.next_seq_id
+                self.next_seq_id += 1
+                self.requests.append((seq_id, prompt, sampling_params.max_tokens, slo_ratio))
+                return seq_id
 
             def run(self):
-                return ["o0", "o1"], [8, 4], [[1], [1]], 0.4, {"unused": True}
+                return [
+                    (10, [101] * 8, [1]),
+                    (11, [202] * 4, [1]),
+                ], 0.4
 
             def exit(self):
                 self.exited = True
@@ -128,12 +139,70 @@ class RunWorkloadFormattingTests(unittest.TestCase):
 
         self.assertEqual(
             fake_system.requests,
-            [("p0", 8, 1.0), ("p1", 4, 0.6)],
+            [(10, "p0", 8, 1.0), (11, "p1", 4, 0.6)],
         )
         self.assertTrue(fake_system.exited)
         self.assertEqual(result["metrics"]["completed_requests"], 2)
         self.assertIn("system(adaserve)", result["result_text"])
         self.assertEqual(len(result["records"]), 2)
+
+    def test_run_workload_aligns_outputs_by_seq_id_not_position(self):
+        class FakeSamplingParams:
+            def __init__(self, temperature, ignore_eos, max_tokens):
+                self.temperature = temperature
+                self.ignore_eos = ignore_eos
+                self.max_tokens = max_tokens
+
+        class FakeSystem:
+            def __init__(self):
+                self.seq_ids = [41, 99]
+                self.calls = []
+                self.exited = False
+
+            def add_request(self, prompt, sampling_params, slo_ratio):
+                seq_id = self.seq_ids[len(self.calls)]
+                self.calls.append((seq_id, prompt, sampling_params.max_tokens, slo_ratio))
+                return seq_id
+
+            def run(self):
+                # Deliberately reverse the output order to force seq_id-based alignment.
+                return [
+                    (99, [9] * 4, [1]),
+                    (41, [4] * 8, [2]),
+                ], 0.4
+
+            def exit(self):
+                self.exited = True
+
+        fake_system = FakeSystem()
+        args = types.SimpleNamespace(
+            system="adaserve",
+            input_file="unused.json",
+            baseline_latency_per_token_ms=30.0,
+            temperature=0.0,
+            ignore_eos=True,
+            num_pearl_steps=100,
+        )
+        workload = [
+            WorkloadRequest(0, 0.0, "p0", 8, 1.0),
+            WorkloadRequest(1, 10.0, "p1", 4, 0.6),
+        ]
+
+        result = run_workload(
+            args,
+            load_workload_fn=lambda _: workload,
+            create_system_fn=lambda *_: fake_system,
+            sampling_params_cls=FakeSamplingParams,
+        )
+
+        self.assertEqual(
+            [record.request_id for record in result["records"]],
+            [0, 1],
+        )
+        self.assertEqual(
+            [record.num_generated_tokens for record in result["records"]],
+            [8, 4],
+        )
 
 
 if __name__ == "__main__":

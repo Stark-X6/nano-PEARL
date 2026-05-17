@@ -15,13 +15,15 @@ class BenchmarkSystem:
     run_method_name: str
     num_pearl_steps: int
     needs_slo_ratio: bool
+    seq_id_to_request_id: dict[int, int]
 
     def add_request(self, prompt: str | list[int], sampling_params: Any, slo_ratio: float) -> None:
         sampling_params = copy.deepcopy(sampling_params)
         if self.needs_slo_ratio:
-            self.engine.add_request(prompt, sampling_params, slo_ratio=slo_ratio)
+            seq_id = self.engine.add_request(prompt, sampling_params, slo_ratio=slo_ratio)
         else:
-            self.engine.add_request(prompt, sampling_params)
+            seq_id = self.engine.add_request(prompt, sampling_params)
+        self.seq_id_to_request_id[seq_id] = len(self.seq_id_to_request_id)
 
     def run(self):
         run_method = getattr(self.engine, self.run_method_name)
@@ -84,31 +86,35 @@ def create_system(
         return BenchmarkSystem(
             name=system_name,
             engine=engine,
-            run_method_name="vllm_spec_bench_generate",
+            run_method_name="vllm_spec_bench_generate_raw",
             num_pearl_steps=args.num_pearl_steps,
             needs_slo_ratio=False,
+            seq_id_to_request_id={},
         )
     if system_name == "pearl-spec":
         return BenchmarkSystem(
             name=system_name,
             engine=engine,
-            run_method_name="bench_generate",
+            run_method_name="bench_generate_raw",
             num_pearl_steps=args.num_pearl_steps,
             needs_slo_ratio=False,
+            seq_id_to_request_id={},
         )
     if system_name == "adaserve":
         return BenchmarkSystem(
             name=system_name,
             engine=engine,
-            run_method_name="slo_bench_generate",
+            run_method_name="slo_bench_generate_raw",
             num_pearl_steps=args.num_pearl_steps,
             needs_slo_ratio=True,
+            seq_id_to_request_id={},
         )
 
     return BenchmarkSystem(
         name=system_name,
         engine=engine,
-        run_method_name="slo_bench_generate_double_buffer",
+        run_method_name="slo_bench_generate_double_buffer_raw",
         num_pearl_steps=args.num_pearl_steps,
         needs_slo_ratio=True,
+        seq_id_to_request_id={},
     )

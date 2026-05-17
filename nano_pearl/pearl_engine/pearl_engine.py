@@ -119,6 +119,7 @@ class PEARLEngine:
         self.controller.write_target_shm("add_request", seq)
         self.control_event.wait()
         self.control_event.clear()
+        return seq.seq_id
     
     def generate(self):
         self.controller.write_draft_shm("pearl_generate")
@@ -163,6 +164,15 @@ class PEARLEngine:
 
         return output_text, num_tokens, num_acc_tokens, time
 
+    def bench_generate_raw(self, num_pearl_steps: int = 100):
+        self.controller.write_draft_shm("pearl_bench_generate", num_pearl_steps)
+        self.controller.write_target_shm("pearl_bench_generate", num_pearl_steps)
+        self.control_event.wait()
+        self.control_event.clear()
+        output, time = self.controller.read_output()
+        output = sorted(output, key=lambda x: x[0])
+        return output, time
+
     def vllm_spec_generate(self):
         self.controller.write_draft_shm("vllm_spec_generate")
         self.controller.write_target_shm("vllm_spec_generate")
@@ -190,3 +200,12 @@ class PEARLEngine:
         num_tokens = [len(t) for t in token_ids]
 
         return output_text, num_tokens, num_acc_tokens, time
+
+    def vllm_spec_bench_generate_raw(self, num_pearl_steps: int = 100):
+        self.controller.write_draft_shm("vllm_spec_bench_generate", num_pearl_steps)
+        self.controller.write_target_shm("vllm_spec_bench_generate", num_pearl_steps)
+        self.control_event.wait()
+        self.control_event.clear()
+        output, time = self.controller.read_output()
+        output = sorted(output, key=lambda x: x[0])
+        return output, time

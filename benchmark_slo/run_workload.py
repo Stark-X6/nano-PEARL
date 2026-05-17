@@ -32,36 +32,38 @@ def parse_args() -> argparse.Namespace:
 
 def build_request_records(
     workload: list[WorkloadRequest],
-    num_tokens: list[int],
+    raw_output: list[tuple[int, list[int], list[int]]],
+    seq_id_to_request_id: dict[int, int],
     total_run_time_s: float,
     baseline_latency_per_token_ms: float,
 ) -> list[RequestRecord]:
-    if len(workload) != len(num_tokens):
-        raise ValueError("workload size and num_tokens size must match")
+    if len(workload) != len(raw_output):
+        raise ValueError("workload size and raw_output size must match")
 
     total_run_time_ms = total_run_time_s * 1000.0
-    records: list[RequestRecord] = []
+    records_by_request_id: dict[int, RequestRecord] = {}
 
-    for request, generated_tokens in zip(workload, num_tokens):
+    for seq_id, token_ids, _ in raw_output:
+        request_id = seq_id_to_request_id[seq_id]
+        request = workload[request_id]
+        generated_tokens = len(token_ids)
         per_token_latency_ms = total_run_time_ms / max(generated_tokens, 1)
         if request.slo_ratio > 0:
             slo_constraint_ms = request.slo_ratio * baseline_latency_per_token_ms
         else:
             slo_constraint_ms = -request.slo_ratio
 
-        records.append(
-            RequestRecord(
-                request_id=request.request_id,
-                slo_ratio=request.slo_ratio,
-                arrival_time_ms=request.emission_time_ms,
-                decode_start_time_ms=request.emission_time_ms,
-                finish_time_ms=request.emission_time_ms + total_run_time_ms,
-                num_generated_tokens=generated_tokens,
-                attained=per_token_latency_ms <= slo_constraint_ms,
-            )
+        records_by_request_id[request_id] = RequestRecord(
+            request_id=request.request_id,
+            slo_ratio=request.slo_ratio,
+            arrival_time_ms=request.emission_time_ms,
+            decode_start_time_ms=request.emission_time_ms,
+            finish_time_ms=request.emission_time_ms + total_run_time_ms,
+            num_generated_tokens=generated_tokens,
+            attained=per_token_latency_ms <= slo_constraint_ms,
         )
 
-    return records
+    return [records_by_request_id[idx] for idx in range(len(workload))]
 
 
 def format_result_text(system_name: str, metrics: dict) -> str:
@@ -99,21 +101,25 @@ def run_workload(
 
     workload = load_workload_fn(args.input_file)
     system = create_system_fn(args.system, args)
+    local_seq_id_to_request_id: dict[int, int] = {}
 
     try:
-        for request in workload:
+        for request_index, request in enumerate(workload):
             sampling_params = sampling_params_cls(
                 temperature=getattr(args, "temperature", 0.0),
                 ignore_eos=getattr(args, "ignore_eos", True),
                 max_tokens=request.output_length,
             )
-            system.add_request(request.prompt, sampling_params, request.slo_ratio)
+            seq_id = system.add_request(request.prompt, sampling_params, request.slo_ratio)
+            if seq_id is not None:
+                local_seq_id_to_request_id[seq_id] = request_index
 
-        run_output = system.run()
-        _, num_tokens, _, elapsed_time_s = run_output[:4]
+        raw_output, elapsed_time_s = system.run()
+        seq_id_to_request_id = getattr(system, "seq_id_to_request_id", None) or local_seq_id_to_request_id
         records = build_request_records(
             workload=workload,
-            num_tokens=num_tokens,
+            raw_output=raw_output,
+            seq_id_to_request_id=seq_id_to_request_id,
             total_run_time_s=elapsed_time_s,
             baseline_latency_per_token_ms=getattr(args, "baseline_latency_per_token_ms", -1.0),
         )
@@ -123,7 +129,7 @@ def run_workload(
             "records": records,
             "metrics": metrics,
             "result_text": result_text,
-            "raw_output": run_output,
+            "raw_output": raw_output,
         }
     finally:
         system.exit()

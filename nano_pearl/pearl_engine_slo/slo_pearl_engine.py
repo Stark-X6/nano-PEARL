@@ -150,6 +150,7 @@ class SLOPearlEngine:
         self.controller.write_target_shm("add_request", slo_seq)
         self.control_event.wait()
         self.control_event.clear()
+        return seq.seq_id
 
     def slo_generate(self):
         """Run SLO-aware PEARL generation.
@@ -203,6 +204,15 @@ class SLOPearlEngine:
         )
 
         return output_text, num_tokens, num_acc_tokens, elapsed_time, slo_metrics
+
+    def slo_bench_generate_raw(self, num_pearl_steps=100):
+        self.controller.write_draft_shm("slo_bench_generate", num_pearl_steps)
+        self.controller.write_target_shm("slo_bench_generate", num_pearl_steps)
+        self.control_event.wait()
+        self.control_event.clear()
+        output, elapsed_time = self.controller.read_output()
+        output = sorted(output, key=lambda x: x[0])
+        return output, elapsed_time
 
     def _compute_metrics(self, output, elapsed_time, num_tokens, num_acc_tokens):
         """Compute SLO attainment metrics.
@@ -346,3 +356,12 @@ class SLOPearlEngine:
         )
 
         return output_text, num_tokens, num_acc_tokens, elapsed_time, slo_metrics
+
+    def slo_bench_generate_double_buffer_raw(self, num_pearl_steps=100):
+        self.controller.write_draft_shm("slo_bench_generate_double_buffer", num_pearl_steps)
+        self.controller.write_target_shm("slo_bench_generate_double_buffer", num_pearl_steps)
+        self.control_event.wait()
+        self.control_event.clear()
+        output, elapsed_time = self.controller.read_output()
+        output = sorted(output, key=lambda x: x[0])
+        return output, elapsed_time
