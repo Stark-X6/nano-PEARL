@@ -59,41 +59,43 @@ class PEARLEngine:
         self.ps = []
         
         ctx = mp.get_context("spawn")
-        # the control event is used to wait for the sub-processes to be ready
-        self.control_event = ctx.Event()
-        self.controller = Controller(config, self.control_event)
+        # each process has its own completion event to signal the main process
+        self.done_events = [ctx.Event() for _ in range(config.world_size)]
+        self.controller = Controller(config, None) # control_event is no longer used globally
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.draft_config.model, use_fast=True)
         config.eos = self.config.draft_config.eos
         logger.info(f"[Main Process] EOS token id: {config.eos}, EOS tokens: {self.tokenizer.decode(config.eos)}")   
 
         for i in range(config.world_size):
             event = ctx.Event()
-            process = ctx.Process(target=DraftModelRunner if i in config.draft_config.devices else TargetModelRunner, args=(config, i, event, self.control_event))
+            process = ctx.Process(target=DraftModelRunner if i in config.draft_config.devices else TargetModelRunner, args=(config, i, event, self.done_events[i]))
             process.daemon = True        
             process.start()
             self.ps.append(process)
             self.controller.add_event(i, event)
         
-        # wait for the initialization of the draft and target TP models
-        logger.info("[Main Process] Waiting for the initialization of the draft and target TP models...", color="red")
-        self.control_event.wait()
-        self.control_event.clear()
+        # wait for the initialization of all draft and target TP models
+        logger.info("[Main Process] Waiting for the initialization of all draft and target TP models...", color="red")
+        self.wait_for_all()
         
         atexit.register(self.exit)
     
+
+    def wait_for_all(self):
+        for event in self.done_events:
+            event.wait()
+            event.clear()
 
     def log(self, content: str):
         logger.info(f"[Main Process] Running log function, waiting for the sub-processes", color="red")
         self.controller.write_draft_shm("log", content)
         self.controller.write_target_shm("log", content)
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
     def run_model(self, seqs: list[Sequence], is_prefill: bool):        
         self.controller.write_draft_shm("run_model", seqs, is_prefill)
         self.controller.write_target_shm("run_model", seqs, is_prefill)
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
     def exit(self):
         self.controller.write_draft_shm("exit")
@@ -117,15 +119,13 @@ class PEARLEngine:
         seq = Sequence(prompt, sampling_params)
         self.controller.write_draft_shm("add_request", seq)
         self.controller.write_target_shm("add_request", seq)
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
         return seq.seq_id
     
     def generate(self):
         self.controller.write_draft_shm("pearl_generate")
         self.controller.write_target_shm("pearl_generate")
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
         output, time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
@@ -139,8 +139,7 @@ class PEARLEngine:
         """Only use target model for Auto-Regressive generation."""
         self.controller.write_draft_shm("parallel_generate")
         self.controller.write_target_shm("parallel_generate")
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
         output, time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
@@ -153,8 +152,7 @@ class PEARLEngine:
     def bench_generate(self, num_pearl_steps: int = 100):
         self.controller.write_draft_shm("pearl_bench_generate", num_pearl_steps)
         self.controller.write_target_shm("pearl_bench_generate", num_pearl_steps)
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
         output, time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
@@ -167,8 +165,7 @@ class PEARLEngine:
     def bench_generate_raw(self, num_pearl_steps: int = 100):
         self.controller.write_draft_shm("pearl_bench_generate", num_pearl_steps)
         self.controller.write_target_shm("pearl_bench_generate", num_pearl_steps)
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
         output, time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
         return output, time
@@ -176,8 +173,7 @@ class PEARLEngine:
     def vllm_spec_generate(self):
         self.controller.write_draft_shm("vllm_spec_generate")
         self.controller.write_target_shm("vllm_spec_generate")
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
         output, time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
@@ -190,8 +186,7 @@ class PEARLEngine:
     def vllm_spec_bench_generate(self, num_pearl_steps: int = 100):
         self.controller.write_draft_shm("vllm_spec_bench_generate", num_pearl_steps)
         self.controller.write_target_shm("vllm_spec_bench_generate", num_pearl_steps)
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
         output, time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
@@ -204,8 +199,7 @@ class PEARLEngine:
     def vllm_spec_bench_generate_raw(self, num_pearl_steps: int = 100):
         self.controller.write_draft_shm("vllm_spec_bench_generate", num_pearl_steps)
         self.controller.write_target_shm("vllm_spec_bench_generate", num_pearl_steps)
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
         output, time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
         return output, time

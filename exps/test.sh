@@ -41,7 +41,7 @@ print_or_run() {
     local output_file="$2"
     shift 2
     local cmd=(
-        python benchmark_slo/run_workload.py
+        python -m benchmark_slo.run_workload
         --system "$system_name"
         --input-file "$DATASETS_FILE"
         --draft-model "$SSM_MODEL"

@@ -40,7 +40,7 @@ class ModelRunnerBase:
         self.global_config = config
         self.group_config = config.draft_config if self.is_draft else config.target_config
         self.hf_config = self.group_config.hf_config
-        self.control_event = control_event if rank == 0  else None
+        self.control_event = control_event
 
         self.block_size = self.global_config.kvcache_block_size
         self.tensor_parallel_size = self.group_config.tensor_parallel_size
