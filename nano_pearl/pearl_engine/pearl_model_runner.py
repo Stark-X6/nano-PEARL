@@ -217,7 +217,7 @@ class ModelRunnerBase:
         self.shm = SharedMemory(name=self.group_name)
         if self.rank == 0:
             logger.info(f"[Sub-Process] Draft Model and Target Model initialized. Starting to run the model...", color="yellow")
-            self.control_event.set()
+        self.control_event.set()
         self.loop()
     
     def init_model_and_kvcache(self):
@@ -275,17 +275,20 @@ class ModelRunnerBase:
     def loop(self):
         while True:
             method_name, args = self.read_shm()
-            self.call(method_name, *args)
-            if self.rank == 0 and method_name != "exit":
-                self.control_event.set()
-            
+            try:
+                self.call(method_name, *args)
+            finally:
+                if method_name != "exit":
+                    self.control_event.set()
+
             if method_name == "exit":
                 break
 
     def read_shm(self):
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
+        payload = bytes(self.shm.buf[4:n+4])
+        method_name, *args = pickle.loads(payload)
         self.event.clear()
         return method_name, args
 
