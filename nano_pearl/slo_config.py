@@ -90,7 +90,8 @@ class SLOConfig:
             gpu_memory_utilization=self.gpu_memory_utilization,
             kvcache_block_size=self.kvcache_block_size,
             enforce_eager=self.enforce_eager,
-            gamma=-1,  # gamma is managed by SLOScheduler, not PEARL
+            gamma=1,
+            skip_auto_set_gamma=True,
         )
 
         logger.info("=" * 50)

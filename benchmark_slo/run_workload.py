@@ -37,11 +37,8 @@ def build_request_records(
     total_run_time_s: float,
     baseline_latency_per_token_ms: float,
 ) -> list[RequestRecord]:
-    if len(workload) != len(raw_output):
-        raise ValueError("workload size and raw_output size must match")
-
     total_run_time_ms = total_run_time_s * 1000.0
-    records_by_request_id: dict[int, RequestRecord] = {}
+    records: list[RequestRecord] = []
 
     for seq_id, token_ids, _ in raw_output:
         request_id = seq_id_to_request_id[seq_id]
@@ -53,17 +50,20 @@ def build_request_records(
         else:
             slo_constraint_ms = -request.slo_ratio
 
-        records_by_request_id[request_id] = RequestRecord(
-            request_id=request.request_id,
-            slo_ratio=request.slo_ratio,
-            arrival_time_ms=request.emission_time_ms,
-            decode_start_time_ms=request.emission_time_ms,
-            finish_time_ms=request.emission_time_ms + total_run_time_ms,
-            num_generated_tokens=generated_tokens,
-            attained=per_token_latency_ms <= slo_constraint_ms,
+        records.append(
+            RequestRecord(
+                request_id=request.request_id,
+                slo_ratio=request.slo_ratio,
+                arrival_time_ms=request.emission_time_ms,
+                decode_start_time_ms=request.emission_time_ms,
+                finish_time_ms=request.emission_time_ms + total_run_time_ms,
+                num_generated_tokens=generated_tokens,
+                attained=per_token_latency_ms <= slo_constraint_ms,
+            )
         )
 
-    return [records_by_request_id[idx] for idx in range(len(workload))]
+    records.sort(key=lambda record: record.request_id)
+    return records
 
 
 def format_result_text(system_name: str, metrics: dict) -> str:

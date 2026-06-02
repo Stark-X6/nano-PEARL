@@ -82,6 +82,7 @@ class PEARLConfig:
     num_kvcache_blocks: int = -1
     enforce_eager: bool = False
     gamma: int = -1
+    skip_auto_set_gamma: bool = False
     def __post_init__(self):
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")

@@ -285,14 +285,24 @@ class SLOPearlEngine:
 
     def exit(self):
         """Shutdown all runner processes."""
-        self.controller.write_draft_shm("exit")
-        self.controller.write_target_shm("exit")
+        if getattr(self, '_closed', False):
+            return
+        self._closed = True
+
+        if getattr(self.controller, 'draft_shm', None) is not None:
+            self.controller.write_draft_shm("exit")
+        if getattr(self.controller, 'target_shm', None) is not None:
+            self.controller.write_target_shm("exit")
         for p in self.ps:
             p.join()
-        self.controller.draft_shm.close()
-        self.controller.target_shm.close()
-        self.controller.draft_shm.unlink()
-        self.controller.target_shm.unlink()
+        if getattr(self.controller, 'draft_shm', None) is not None:
+            self.controller.draft_shm.close()
+            self.controller.draft_shm.unlink()
+            self.controller.draft_shm = None
+        if getattr(self.controller, 'target_shm', None) is not None:
+            self.controller.target_shm.close()
+            self.controller.target_shm.unlink()
+            self.controller.target_shm = None
 
     def slo_generate_double_buffer(self):
         """

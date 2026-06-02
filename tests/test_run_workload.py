@@ -204,6 +204,53 @@ class RunWorkloadFormattingTests(unittest.TestCase):
             [8, 4],
         )
 
+    def test_run_workload_accepts_partial_bench_output(self):
+        class FakeSamplingParams:
+            def __init__(self, temperature, ignore_eos, max_tokens):
+                self.temperature = temperature
+                self.ignore_eos = ignore_eos
+                self.max_tokens = max_tokens
+
+        class FakeSystem:
+            def __init__(self):
+                self.exited = False
+
+            def add_request(self, prompt, sampling_params, slo_ratio):
+                return len(prompt)
+
+            def run(self):
+                return [
+                    (2, [2] * 6, [1]),
+                    (3, [3] * 7, [1]),
+                ], 0.5
+
+            def exit(self):
+                self.exited = True
+
+        args = types.SimpleNamespace(
+            system="pearl-spec",
+            input_file="unused.json",
+            baseline_latency_per_token_ms=30.0,
+            temperature=0.0,
+            ignore_eos=True,
+            num_pearl_steps=100,
+        )
+        workload = [
+            WorkloadRequest(0, 0.0, "aa", 8, 1.0),
+            WorkloadRequest(1, 1.0, "bbb", 8, 1.0),
+            WorkloadRequest(2, 2.0, "cccc", 8, 1.0),
+        ]
+
+        result = run_workload(
+            args,
+            load_workload_fn=lambda _: workload,
+            create_system_fn=lambda *_: FakeSystem(),
+            sampling_params_cls=FakeSamplingParams,
+        )
+
+        self.assertEqual(len(result["records"]), 2)
+        self.assertEqual([record.request_id for record in result["records"]], [0, 1])
+
 
 if __name__ == "__main__":
     unittest.main()

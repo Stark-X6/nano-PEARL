@@ -49,7 +49,7 @@ class ModelRunnerBase:
 
         self.init_dist()
         self.init_model_and_kvcache()
-        if self.gamma == -1:
+        if self.gamma == -1 and not getattr(self.global_config, 'skip_auto_set_gamma', False):
             self.auto_set_gamma()
         self.init_shared_memory()
         
@@ -523,6 +523,19 @@ class ModelRunnerBase:
         self.scheduler.clear()
         dist.barrier()
 
+    def resolve_batch_gamma(self, batch_size: int) -> int:
+        if self.gamma != -1:
+            return self.gamma
+        eligible = sorted(x for x in self.gamma_list if x >= batch_size)
+        if eligible:
+            return self.gamma_list[eligible[0]]
+        max_key = max(self.gamma_list)
+        logger.warning(
+            f"Batch size {batch_size} exceeds profiled gamma table max {max_key}; using fallback gamma for max profiled batch size.",
+            color="yellow",
+        )
+        return self.gamma_list[max_key]
+
     def parallel_generate(self):
         dist.barrier()
 
@@ -552,7 +565,7 @@ class ModelRunnerBase:
 
         # determine the gamma for each batch size
         if self.gamma == -1:
-            self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+            self.gamma = self.resolve_batch_gamma(len(self.scheduler.running))
 
         while not self.scheduler.is_finished():
             self.pearl_step()
@@ -587,7 +600,7 @@ class ModelRunnerBase:
             seq.max_tokens = 1e8
             seq.ignore_eos = True
         if self.gamma == -1:
-            self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+            self.gamma = self.resolve_batch_gamma(len(self.scheduler.running))
 
         for _ in range(num_pearl_steps):
             self.pearl_step()
@@ -622,7 +635,7 @@ class ModelRunnerBase:
         self.prefill()
 
         if self.gamma == -1:
-            self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+            self.gamma = self.resolve_batch_gamma(len(self.scheduler.running))
 
         while not self.scheduler.is_finished():
             self.vllm_spec_step()
@@ -655,7 +668,7 @@ class ModelRunnerBase:
             seq.max_tokens = 1e8
             seq.ignore_eos = True
         if self.gamma == -1:
-            self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+            self.gamma = self.resolve_batch_gamma(len(self.scheduler.running))
 
         for _ in range(num_pearl_steps):
             self.vllm_spec_step()
