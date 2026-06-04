@@ -19,7 +19,12 @@ if [ -z "${DATASETS_FILE:-}" ]; then
 fi
 
 DRAFT_TP=${DRAFT_TP:-1}
-TARGET_TP=${TARGET_TP:-3}
+if [ -z "${TARGET_TP:-}" ]; then
+    AVAILABLE_GPUS=$(python -c 'import torch; print(torch.cuda.device_count())')
+    TARGET_TP=$(( AVAILABLE_GPUS > DRAFT_TP ? AVAILABLE_GPUS - DRAFT_TP : 1 ))
+else
+    TARGET_TP=${TARGET_TP}
+fi
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-128}
