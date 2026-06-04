@@ -80,7 +80,7 @@ class SLOPearlEngine:
         self.ps = []
 
         ctx = mp.get_context("spawn")
-        self.control_event = ctx.Event()
+        self.done_events = [ctx.Event() for _ in range(self.config.world_size)]
 
         # Store SLO parameters on PEARLConfig for runners to access
         # (runners receive PEARLConfig in __init__)
@@ -92,7 +92,7 @@ class SLOPearlEngine:
         self.config._slo_verify_step_latency_ms = slo_config.verify_step_latency_ms
         self.config._slo_total_budget = slo_config.total_draft_budget
 
-        self.controller = SLOController(slo_config, self.control_event)
+        self.controller = SLOController(slo_config, None)
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.draft_config.model, use_fast=True
         )
@@ -109,7 +109,7 @@ class SLOPearlEngine:
             runner_cls = SLODraftRunner if i in self.config.draft_config.devices else SLOTargetRunner
             process = ctx.Process(
                 target=runner_cls,
-                args=(self.config, i, event, self.control_event),
+                args=(self.config, i, event, self.done_events[i]),
             )
             process.daemon = True
             process.start()
@@ -119,10 +119,14 @@ class SLOPearlEngine:
         logger.info(
             "[SLO Engine] Waiting for model initialization...", color="red"
         )
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
         atexit.register(self.exit)
+
+    def wait_for_all(self):
+        for event in self.done_events:
+            event.wait()
+            event.clear()
 
     def add_request(self, prompt, sampling_params=None, slo_ratio=1.0):
         """Add a request with SLO ratio.
@@ -148,8 +152,7 @@ class SLOPearlEngine:
 
         self.controller.write_draft_shm("add_request", slo_seq)
         self.controller.write_target_shm("add_request", slo_seq)
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
         return seq.seq_id
 
     def slo_generate(self):
@@ -160,8 +163,7 @@ class SLOPearlEngine:
         """
         self.controller.write_draft_shm("slo_generate")
         self.controller.write_target_shm("slo_generate")
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
         output, elapsed_time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
@@ -187,8 +189,7 @@ class SLOPearlEngine:
         """
         self.controller.write_draft_shm("slo_bench_generate", num_pearl_steps)
         self.controller.write_target_shm("slo_bench_generate", num_pearl_steps)
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
         output, elapsed_time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
@@ -208,8 +209,7 @@ class SLOPearlEngine:
     def slo_bench_generate_raw(self, num_pearl_steps=100):
         self.controller.write_draft_shm("slo_bench_generate", num_pearl_steps)
         self.controller.write_target_shm("slo_bench_generate", num_pearl_steps)
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
         output, elapsed_time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
         return output, elapsed_time
@@ -278,8 +278,7 @@ class SLOPearlEngine:
         """
         self.controller.write_draft_shm("profile_slo_latency")
         self.controller.write_target_shm("profile_slo_latency")
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
         logger.info("[SLO Engine] Baseline latency profiling complete.")
 
@@ -316,10 +315,7 @@ class SLOPearlEngine:
         # 通过共享内存命令字触发 Runner 执行新函数
         self.controller.write_draft_shm("slo_generate_double_buffer")
         self.controller.write_target_shm("slo_generate_double_buffer")
-         
-        # 阻塞等待子进程完成
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
         # 读取并解析输出
         output, elapsed_time = self.controller.read_output()
@@ -347,9 +343,7 @@ class SLOPearlEngine:
         # 发送带参数的指令（指定运行步数）
         self.controller.write_draft_shm("slo_bench_generate_double_buffer", num_pearl_steps)
         self.controller.write_target_shm("slo_bench_generate_double_buffer", num_pearl_steps)
-        
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
 
         output, elapsed_time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
@@ -370,8 +364,7 @@ class SLOPearlEngine:
     def slo_bench_generate_double_buffer_raw(self, num_pearl_steps=100):
         self.controller.write_draft_shm("slo_bench_generate_double_buffer", num_pearl_steps)
         self.controller.write_target_shm("slo_bench_generate_double_buffer", num_pearl_steps)
-        self.control_event.wait()
-        self.control_event.clear()
+        self.wait_for_all()
         output, elapsed_time = self.controller.read_output()
         output = sorted(output, key=lambda x: x[0])
         return output, elapsed_time

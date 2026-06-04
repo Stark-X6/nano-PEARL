@@ -530,7 +530,7 @@ class ModelRunnerBase:
         if eligible:
             return self.gamma_list[eligible[0]]
         max_key = max(self.gamma_list)
-        logger.warning(
+        logger.info(
             f"Batch size {batch_size} exceeds profiled gamma table max {max_key}; using fallback gamma for max profiled batch size.",
             color="yellow",
         )
