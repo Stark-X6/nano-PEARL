@@ -1,4 +1,3 @@
-import atexit
 from dataclasses import fields
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -78,7 +77,6 @@ class PEARLEngine:
         logger.info("[Main Process] Waiting for the initialization of all draft and target TP models...", color="red")
         self.wait_for_all()
         
-        atexit.register(self.exit)
     
 
     def wait_for_all(self):

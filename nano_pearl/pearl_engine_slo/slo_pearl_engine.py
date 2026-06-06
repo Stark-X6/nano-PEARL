@@ -11,7 +11,6 @@ Provides:
   - profile_baseline_latency() for auto-profiling
 """
 
-import atexit
 import pickle
 import time
 from dataclasses import dataclass
@@ -121,7 +120,6 @@ class SLOPearlEngine:
         )
         self.wait_for_all()
 
-        atexit.register(self.exit)
 
     def wait_for_all(self):
         for event in self.done_events:
