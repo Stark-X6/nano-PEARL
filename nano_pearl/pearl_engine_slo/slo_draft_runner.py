@@ -412,6 +412,11 @@ class SLODraftRunner(ModelRunnerBase):
 
         # 无论 SLO 如何，先统一为 batch 内所有请求起草 max_gamma 步
         for step in range(self.max_gamma):
+            for seq in seqs:
+                while not self.scheduler.block_manager.can_append(seq):
+                    self.scheduler.preempt(self.scheduler.running[-1])
+                self.scheduler.block_manager.may_append(seq)
+
             input_ids, positions = self.prepare_pearl_decode(seqs)
             logits = self.run_model(input_ids, positions, False)
             
