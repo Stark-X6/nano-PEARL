@@ -21,6 +21,10 @@ from nano_pearl.pearl_engine.scheduler import is_eos
 from nano_pearl.pearl_engine_slo.slo_sequence import SLOSequence
 from nano_pearl.layers.sampler import norm_logits
 from nano_pearl.utils.context import reset_context, set_context
+from nano_pearl.pearl_engine_slo.slo_verify_protocol import (
+    count_next_round_tokens,
+    count_verify_tokens,
+)
 from nano_pearl.utils.pearl_logger import logger
 
 
@@ -99,7 +103,20 @@ class SLOTargetRunner(ModelRunnerBase):
     def pearl_step(self):
         """Target-side PEARL step: receive gamma_map, prepare decode, verify."""
         seqs, is_prefill = self.scheduler.schedule()
-        assert not is_prefill, "wrong match. current stage is prefill."
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+            temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
+            logits = self.run_model(input_ids, positions, True)
+            sample_tokens = (
+                self.sampler(logits, temperatures)
+                if self.tp_params.local_rank == 0
+                else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            )
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            token_ids = sample_tokens.tolist()
+            reset_context(self.tp_params)
+            self.scheduler.postprocess(seqs, token_ids)
+            return
 
         # Receive gamma_map from draft (Broadcast 1)
         num_seqs = len(seqs)
@@ -123,12 +140,9 @@ class SLOTargetRunner(ModelRunnerBase):
         Broadcast 2 (receive): [to_be_verified_tokens | next_round_input] from draft
         Broadcast 3 (send): verify_res (4, num_seqs) to draft
         """
-        # Compute expected message sizes from gamma_map
-        num_to_be_verified_tokens = sum(
-            1 if seq.pre_verify else gamma_map.get(seq.seq_id, 1)
-            for seq in seqs
-        )
-        num_next_round_input = sum(gamma_map.get(seq.seq_id, 1) for seq in seqs)
+        # Compute expected message sizes from the same protocol used by draft.
+        num_to_be_verified_tokens = count_verify_tokens(seqs, gamma_map)
+        num_next_round_input = count_next_round_tokens(seqs, gamma_map)
 
         # Broadcast 2: receive tokens from draft
         msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input,
@@ -344,8 +358,8 @@ class SLOTargetRunner(ModelRunnerBase):
         self._current_gamma_map = gamma_map
 
         # 计算待接收的消息总长度
-        num_to_be_verified_tokens = sum(1 if seq.pre_verify else gamma_map.get(seq.seq_id, 1) for seq in seqs)
-        num_next_round_input = sum(gamma_map.get(seq.seq_id, 1) for seq in seqs)
+        num_to_be_verified_tokens = count_verify_tokens(seqs, gamma_map)
+        num_next_round_input = count_next_round_tokens(seqs, gamma_map)
 
         # 阻塞点 2: 接收待验证 token 和下轮起草输入
         msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input, dtype=torch.int64, device="cuda")

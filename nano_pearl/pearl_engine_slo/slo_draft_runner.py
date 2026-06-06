@@ -20,6 +20,11 @@ from nano_pearl.pearl_engine.scheduler import is_eos
 from nano_pearl.pearl_engine_slo.slo_sequence import SLOSequence
 from nano_pearl.pearl_engine_slo.slo_scheduler import SLOScheduler
 from nano_pearl.utils.context import reset_context
+from nano_pearl.pearl_engine_slo.slo_verify_protocol import (
+    build_verify_payload,
+    count_next_round_tokens,
+    count_verify_tokens,
+)
 from nano_pearl.utils.pearl_logger import logger
 
 
@@ -99,10 +104,24 @@ class SLODraftRunner(ModelRunnerBase):
         # ===== Phase A: Draft max_gamma tokens for all seqs, collect logits =====
         draft_logits_steps = []      # list of (num_seqs, vocab) tensors
         draft_token_ids_steps = []   # list of list[int]
+        seqs = []
 
         for step in range(self.max_gamma):
             seqs, is_prefill = self.scheduler.schedule()
-            assert not is_prefill, "wrong match. current stage is prefill."
+            if is_prefill:
+                input_ids, positions = self.prepare_prefill(seqs)
+                temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
+                logits = self.run_model(input_ids, positions, True)
+                sample_tokens = (
+                    self.sampler(logits, temperatures)
+                    if self.tp_params.local_rank == 0
+                    else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+                )
+                dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+                token_ids = sample_tokens.tolist()
+                reset_context(self.tp_params)
+                self.scheduler.postprocess(seqs, token_ids)
+                return
 
             input_ids, positions = self.prepare_pearl_decode(seqs)
             logits = self.run_model(input_ids, positions, False)
@@ -181,19 +200,7 @@ class SLODraftRunner(ModelRunnerBase):
         num_seqs = len(seqs)
 
         if self.tp_params.local_rank == 0:
-            to_be_verified_tokens = []
-            next_round_input = []
-
-            for seq in seqs:
-                g = gamma_map.get(seq.seq_id, 1)
-                if seq.pre_verify:
-                    # Verify only 1 token (the last of the previous round)
-                    to_be_verified_tokens.append(seq.token_ids[-g])
-                else:
-                    # Verify g-1 tokens (first already verified in pre-verify)
-                    to_be_verified_tokens.extend(seq.token_ids[-2 * g + 1 : -g + 1])
-                # Send next round's draft tokens
-                next_round_input.extend(seq.token_ids[-g:])
+            to_be_verified_tokens, next_round_input = build_verify_payload(seqs, gamma_map)
 
             # Broadcast 1: gamma_tensor
             gamma_tensor = torch.tensor(
@@ -214,13 +221,9 @@ class SLODraftRunner(ModelRunnerBase):
             gamma_tensor = torch.zeros(num_seqs, dtype=torch.int64, device="cuda")
             dist.broadcast(gamma_tensor, src=self.tp_params.master_rank, group=self.verify_group)
 
-            # Compute message size from gamma_tensor
-            total_gamma = gamma_tensor.sum().item()
-            num_to_verify = sum(
-                1 if seq.pre_verify else gamma_map.get(seq.seq_id, 1) - 1
-                for seq in seqs
-            )
-            msg_size = int(num_to_verify + total_gamma)
+            # Compute message size from the received gamma map.
+            received_gamma_map = {seq.seq_id: int(g) for seq, g in zip(seqs, gamma_tensor.tolist())}
+            msg_size = count_verify_tokens(seqs, received_gamma_map) + count_next_round_tokens(seqs, received_gamma_map)
             msg = torch.zeros(msg_size, dtype=torch.int64, device="cuda")
             dist.broadcast(msg, src=self.tp_params.master_rank, group=self.verify_group)
 
@@ -475,15 +478,7 @@ class SLODraftRunner(ModelRunnerBase):
 
         # 按照“两次广播协议”发送数据到 Target
         if self.tp_params.local_rank == 0:
-            to_be_verified_tokens = []
-            next_round_input = []
-            for seq in seqs:
-                g = gamma_map.get(seq.seq_id, 1)
-                if seq.pre_verify:
-                    to_be_verified_tokens.append(seq.token_ids[-g])
-                else:
-                    to_be_verified_tokens.extend(seq.token_ids[-2 * g + 1 : -g + 1])
-                next_round_input.extend(seq.token_ids[-g:])
+            to_be_verified_tokens, next_round_input = build_verify_payload(seqs, gamma_map)
 
             # 广播 1: 发送每个请求不同的 gamma 值
             gamma_tensor = torch.tensor([gamma_map.get(s.seq_id, 1) for s in seqs], dtype=torch.int64, device="cuda")
@@ -496,9 +491,9 @@ class SLODraftRunner(ModelRunnerBase):
             # 辅助 Rank 配合 NCCL 同步点
             gamma_tensor = torch.zeros(len(seqs), dtype=torch.int64, device="cuda")
             dist.broadcast(gamma_tensor, src=self.tp_params.master_rank, group=self.verify_group)
-            total_gamma = gamma_tensor.sum().item()
-            num_to_verify = sum(1 if seq.pre_verify else gamma_map.get(seq.seq_id, 1) - 1 for seq in seqs)
-            msg = torch.zeros(int(num_to_verify + total_gamma), dtype=torch.int64, device="cuda")
+            received_gamma_map = {seq.seq_id: int(g) for seq, g in zip(seqs, gamma_tensor.tolist())}
+            msg_size = count_verify_tokens(seqs, received_gamma_map) + count_next_round_tokens(seqs, received_gamma_map)
+            msg = torch.zeros(msg_size, dtype=torch.int64, device="cuda")
             dist.broadcast(msg, src=self.tp_params.master_rank, group=self.verify_group)
         
         return gamma_map

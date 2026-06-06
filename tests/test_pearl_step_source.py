@@ -7,6 +7,13 @@ SOURCE = Path(
     "/root/ykxia/nano-PEARL/nano_pearl/pearl_engine/pearl_model_runner.py"
 ).read_text()
 
+SLO_DRAFT_SOURCE = Path(
+    "/root/ykxia/nano-PEARL/nano_pearl/pearl_engine_slo/slo_draft_runner.py"
+).read_text()
+SLO_TARGET_SOURCE = Path(
+    "/root/ykxia/nano-PEARL/nano_pearl/pearl_engine_slo/slo_target_runner.py"
+).read_text()
+
 
 class PearlStepSourceTests(unittest.TestCase):
     def test_draft_pearl_step_no_longer_asserts_on_prefill(self):
@@ -23,6 +30,26 @@ class PearlStepSourceTests(unittest.TestCase):
         match = re.search(
             r"class TargetModelRunner.*?def pearl_step\(self\):(.*?)def vllm_spec_step",
             SOURCE,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        body = match.group(1)
+        self.assertNotIn('assert not is_prefill', body)
+
+    def test_slo_draft_pearl_step_no_longer_asserts_on_prefill(self):
+        match = re.search(
+            r"class SLODraftRunner.*?def pearl_step\(self\):(.*?)def prepare_pearl_decode",
+            SLO_DRAFT_SOURCE,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        body = match.group(1)
+        self.assertNotIn('assert not is_prefill', body)
+
+    def test_slo_target_pearl_step_no_longer_asserts_on_prefill(self):
+        match = re.search(
+            r"class SLOTargetRunner.*?def pearl_step\(self\):(.*?)@torch.inference_mode",
+            SLO_TARGET_SOURCE,
             re.S,
         )
         self.assertIsNotNone(match)
