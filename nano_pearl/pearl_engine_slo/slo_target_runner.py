@@ -519,9 +519,8 @@ class SLOTargetRunner(ModelRunnerBase):
         # 初始指针对齐
         curr_target_batch = batch_0
         next_target_batch = batch_1
-        fallback_to_single_batch = False
 
-        while not self.scheduler.is_finished():
+        while curr_target_batch:
             print(f"--- [Target Side] Waiting for Draft data (B1)... ---")
             # A. 接收并计算：阻塞等待 Draft 发起 Batch X 的验证
             logits, msg, num_v, temps, g_map = self.verify_double_buffer_recv_and_run(curr_target_batch)
@@ -532,15 +531,14 @@ class SLOTargetRunner(ModelRunnerBase):
 
             curr_target_batch = self._filter_active_batch(curr_target_batch)
             next_target_batch = self._filter_active_batch(next_target_batch)
-            if not curr_target_batch or not next_target_batch:
-                fallback_to_single_batch = True
+            if self.scheduler.is_finished() or not curr_target_batch or not next_target_batch:
                 break
 
             print(f"--- [Target Side] Results sent for B1. Moving to next batch... ---")
             # C. 轮换 Batch
             curr_target_batch, next_target_batch = next_target_batch, curr_target_batch
 
-        if fallback_to_single_batch:
+        if not self.scheduler.is_finished():
             while not self.scheduler.is_finished():
                 self.pearl_step()
 
@@ -578,9 +576,9 @@ class SLOTargetRunner(ModelRunnerBase):
 
         curr_target_batch = batch_0
         next_target_batch = batch_1
-
         steps_completed = 0
-        for _ in range(num_pearl_steps):
+
+        while steps_completed < num_pearl_steps and curr_target_batch:
             print(f"--- [Target Side] Waiting for Draft data (B1)... ---")
             logits, msg, num_v, temps, g_map = self.verify_double_buffer_recv_and_run(curr_target_batch)
             print(f"--- [Target Side] Finished RunModel for B1. Now sending results back... ---")
@@ -589,7 +587,7 @@ class SLOTargetRunner(ModelRunnerBase):
 
             curr_target_batch = self._filter_active_batch(curr_target_batch)
             next_target_batch = self._filter_active_batch(next_target_batch)
-            if not curr_target_batch or not next_target_batch:
+            if steps_completed >= num_pearl_steps or not curr_target_batch or not next_target_batch:
                 break
 
             print(f"--- [Target Side] Results sent for B1. Moving to next batch... ---")

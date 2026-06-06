@@ -45,6 +45,29 @@ class SLODoubleBufferSourceTests(unittest.TestCase):
         self.assertIn("_filter_active_batch", body)
         self.assertIn("self.pearl_step()", body)
 
+    def test_draft_benchmark_loop_drains_inflight_verify_before_fallback(self):
+        match = re.search(
+            r"def slo_bench_generate_double_buffer\(self, num_pearl_steps=100\):(.*?)def _write_output_to_shm",
+            DRAFT_SOURCE,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        body = match.group(1)
+        self.assertIn("has_inflight_verify", body)
+        self.assertIn("steps_sent = 1", body)
+        self.assertIn("if has_inflight_verify and curr_verify_batch:", body)
+
+    def test_target_benchmark_loop_limits_receives_by_completed_steps(self):
+        match = re.search(
+            r"def slo_bench_generate_double_buffer\(self, num_pearl_steps=100\):(.*?)def _write_output_to_shm",
+            TARGET_SOURCE,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        body = match.group(1)
+        self.assertIn("steps_completed = 0", body)
+        self.assertIn("while steps_completed < num_pearl_steps", body)
+
 
 if __name__ == "__main__":
     unittest.main()

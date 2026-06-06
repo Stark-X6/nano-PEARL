@@ -587,33 +587,37 @@ class SLODraftRunner(ModelRunnerBase):
         curr_verify_g_map = g_map_0
 
         # 3. Loop 阶段：核心流水线
-        fallback_to_single_batch = False
-        while not self.scheduler.is_finished():
+        has_inflight_verify = True
+        while steps_sent < num_pearl_steps and curr_draft_batch and curr_verify_batch:
             print(f"--- [Draft Side] Starting Draft Loop for Batch {curr_draft_batch[0].seq_id if curr_draft_batch else 'N/A'} ---")
-            l_next = i_next = None
-            if curr_draft_batch:
-                # A. 并行点：起草下一批 (此时 Target 正在并行验证上一批)
-                l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
+            # A. 并行点：起草下一批 (此时 Target 正在并行验证上一批)
+            l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
 
-            print(f"--- [Draft Side] Finished Drafting B1. Now waiting for B0 verification... ---")
-            # B. 同步点：等待并接收上一批的验证结果
-            self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
+            if has_inflight_verify:
+                print(f"--- [Draft Side] Finished Drafting B1. Now waiting for B0 verification... ---")
+                # B. 同步点：等待并接收上一批的验证结果
+                self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
+                has_inflight_verify = False
 
             curr_verify_batch = self._filter_active_batch(curr_verify_batch)
             curr_draft_batch = self._filter_active_batch(curr_draft_batch)
-            if not curr_verify_batch or not curr_draft_batch:
-                fallback_to_single_batch = True
+            if not curr_verify_batch or not curr_draft_batch or self.scheduler.is_finished():
                 break
 
             print(f"--- [Draft Side] Received B0 results. Updating status... ---")
             # C. 发送点：将刚刚起草完的数据发给 Target
             g_map_next = self.verify_double_buffer_send(curr_draft_batch, l_next, i_next)
+            steps_sent += 1
+            has_inflight_verify = True
 
             # D. 指针交换：轮换 Batch
             curr_draft_batch, curr_verify_batch = curr_verify_batch, curr_draft_batch
             curr_verify_g_map = g_map_next
 
-        if fallback_to_single_batch:
+        if has_inflight_verify and curr_verify_batch:
+            self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
+
+        if not self.scheduler.is_finished():
             while not self.scheduler.is_finished():
                 self.pearl_step()
 
@@ -669,20 +673,20 @@ class SLODraftRunner(ModelRunnerBase):
         curr_draft_batch = batch_1
         curr_verify_batch = batch_0
         curr_verify_g_map = g_map_0
+        steps_sent = 1
+        has_inflight_verify = True
 
         # Loop 阶段：固定步数循环
-        steps_completed = 0
-        for _ in range(num_pearl_steps):
+        while steps_sent < num_pearl_steps and curr_draft_batch and curr_verify_batch:
             print(f"--- [Draft Side] Starting Draft Loop for Batch {curr_draft_batch[0].seq_id if curr_draft_batch else 'N/A'} ---")
-            l_next = i_next = None
-            if curr_draft_batch:
-                # A. 异步起草 (与 Target 并行)
-                l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
+            # A. 异步起草 (与 Target 并行)
+            l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
 
-            print(f"--- [Draft Side] Finished Drafting B1. Now waiting for B0 verification... ---")
-            # B. 接收验证结果 (同步点)
-            self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
-            steps_completed += 1
+            if has_inflight_verify:
+                print(f"--- [Draft Side] Finished Drafting B1. Now waiting for B0 verification... ---")
+                # B. 接收验证结果 (同步点)
+                self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
+                has_inflight_verify = False
 
             curr_verify_batch = self._filter_active_batch(curr_verify_batch)
             curr_draft_batch = self._filter_active_batch(curr_draft_batch)
@@ -692,11 +696,16 @@ class SLODraftRunner(ModelRunnerBase):
             print(f"--- [Draft Side] Received B0 results. Updating status... ---")
             # C. 发送新验证请求
             g_map_next = self.verify_double_buffer_send(curr_draft_batch, l_next, i_next)
+            steps_sent += 1
+            has_inflight_verify = True
             # D. 指针轮换
             curr_draft_batch, curr_verify_batch = curr_verify_batch, curr_draft_batch
             curr_verify_g_map = g_map_next
 
-        for _ in range(num_pearl_steps - steps_completed):
+        if has_inflight_verify and curr_verify_batch:
+            self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
+
+        for _ in range(num_pearl_steps - steps_sent):
             self.pearl_step()
 
         # 4. 完成后收集结果
