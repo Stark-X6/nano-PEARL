@@ -707,11 +707,22 @@ class DraftModelRunner(ModelRunnerBase):
         return super().prepare_decode(seqs)
     
     def pearl_step(self):
+        seqs = []
         for _ in range(self.gamma):
             seqs, is_prefill = self.scheduler.schedule()
-            assert not is_prefill, "wrong match. current stage is prefill."
+            if is_prefill:
+                input_ids, positions = self.prepare_prefill(seqs)
+                temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
+                logits = self.run_model(input_ids, positions, True)
+                sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+                dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+                token_ids = sample_tokens.tolist()
+                reset_context(self.tp_params)
+                self.scheduler.postprocess(seqs, token_ids)
+                continue
+
             input_ids, positions = self.prepare_pearl_decode(seqs)
-            logits = self.run_model(input_ids, positions, is_prefill)
+            logits = self.run_model(input_ids, positions, False)
             # Currently, the temperature of the draft model is set to 0 to avoid communication overhead.
             # We will support temperature in the future.
             sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -723,7 +734,8 @@ class DraftModelRunner(ModelRunnerBase):
             for seq, token_id in zip(seqs, token_ids):
                 seq.append_token(token_id)
 
-        self.verify(seqs)
+        if seqs:
+            self.verify(seqs)
 
     def vllm_spec_step(self):
         # Keep an explicit baseline hook instead of aliasing the PEARL path in
@@ -811,10 +823,20 @@ class TargetModelRunner(ModelRunnerBase):
 
     def pearl_step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        assert not is_prefill, "wrong match. current stage is prefill."
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+            temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
+            logits = self.run_model(input_ids, positions, True)
+            sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            token_ids = sample_tokens.tolist()
+            reset_context(self.tp_params)
+            self.scheduler.postprocess(seqs, token_ids)
+            return
+
         input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        logits = self.run_model(input_ids, positions, False)
         self.verify(logits, seqs, temperatures)
 
     def vllm_spec_step(self):

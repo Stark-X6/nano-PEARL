@@ -8,6 +8,56 @@ from benchmark_slo.systems import SUPPORTED_SYSTEMS, create_system
 from benchmark_slo.workload_loader import WorkloadRequest, load_workload
 
 
+def _make_token_counter(model_path: str):
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+
+    def count_tokens(prompt: str | list[int]) -> int:
+        if isinstance(prompt, list):
+            return len(prompt)
+        templated = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return len(tokenizer.encode(templated))
+
+    return count_tokens
+
+
+def build_workload_batches(
+    workload: list[WorkloadRequest],
+    max_num_seqs: int,
+    max_num_batched_tokens: int,
+    token_count_fn,
+) -> list[list[WorkloadRequest]]:
+    batches: list[list[WorkloadRequest]] = []
+    current_batch: list[WorkloadRequest] = []
+    current_tokens = 0
+
+    for request in workload:
+        request_tokens = token_count_fn(request.prompt)
+        would_overflow = (
+            current_batch
+            and (
+                len(current_batch) >= max_num_seqs
+                or current_tokens + request_tokens > max_num_batched_tokens
+            )
+        )
+        if would_overflow:
+            batches.append(current_batch)
+            current_batch = []
+            current_tokens = 0
+
+        current_batch.append(request)
+        current_tokens += request_tokens
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Formal AdaServe-aligned workload runner")
     parser.add_argument("--system", choices=SUPPORTED_SYSTEMS, required=True)
@@ -93,6 +143,7 @@ def run_workload(
     create_system_fn=create_system,
     compute_metrics_fn=compute_metrics,
     sampling_params_cls=None,
+    token_count_fn=None,
 ) -> dict[str, Any]:
     if sampling_params_cls is None:
         from nano_pearl import SamplingParams
@@ -100,36 +151,57 @@ def run_workload(
         sampling_params_cls = SamplingParams
 
     workload = load_workload_fn(args.input_file)
+    if token_count_fn is None:
+        token_count_fn = _make_token_counter(args.draft_model)
+    batches = build_workload_batches(
+        workload,
+        max_num_seqs=getattr(args, 'max_num_seqs', 128),
+        max_num_batched_tokens=getattr(args, 'max_num_batched_tokens', 8192),
+        token_count_fn=token_count_fn,
+    )
     system = create_system_fn(args.system, args)
-    local_seq_id_to_request_id: dict[int, int] = {}
+    all_records = []
+    all_raw_output = []
+    total_elapsed_time_s = 0.0
 
     try:
-        for request_index, request in enumerate(workload):
-            sampling_params = sampling_params_cls(
-                temperature=getattr(args, "temperature", 0.0),
-                ignore_eos=getattr(args, "ignore_eos", True),
-                max_tokens=request.output_length,
-            )
-            seq_id = system.add_request(request.prompt, sampling_params, request.slo_ratio)
-            if seq_id is not None:
-                local_seq_id_to_request_id[seq_id] = request_index
+        for batch in batches:
+            local_seq_id_to_request_id: dict[int, int] = {}
+            for request in batch:
+                sampling_params = sampling_params_cls(
+                    temperature=getattr(args, "temperature", 0.0),
+                    ignore_eos=getattr(args, "ignore_eos", True),
+                    max_tokens=request.output_length,
+                )
+                seq_id = system.add_request(
+                    request.prompt,
+                    sampling_params,
+                    request.slo_ratio,
+                    request_id=request.request_id,
+                )
+                if seq_id is not None:
+                    local_seq_id_to_request_id[seq_id] = request.request_id
 
-        raw_output, elapsed_time_s = system.run()
-        seq_id_to_request_id = getattr(system, "seq_id_to_request_id", None) or local_seq_id_to_request_id
-        records = build_request_records(
-            workload=workload,
-            raw_output=raw_output,
-            seq_id_to_request_id=seq_id_to_request_id,
-            total_run_time_s=elapsed_time_s,
-            baseline_latency_per_token_ms=getattr(args, "baseline_latency_per_token_ms", -1.0),
-        )
-        metrics = compute_metrics_fn(records, elapsed_time_s)
+            raw_output, elapsed_time_s = system.run()
+            total_elapsed_time_s += elapsed_time_s
+            seq_id_to_request_id = getattr(system, "seq_id_to_request_id", None) or local_seq_id_to_request_id
+            batch_records = build_request_records(
+                workload=workload,
+                raw_output=raw_output,
+                seq_id_to_request_id=seq_id_to_request_id,
+                total_run_time_s=elapsed_time_s,
+                baseline_latency_per_token_ms=getattr(args, "baseline_latency_per_token_ms", -1.0),
+            )
+            all_records.extend(batch_records)
+            all_raw_output.extend(raw_output)
+
+        metrics = compute_metrics_fn(all_records, total_elapsed_time_s)
         result_text = format_result_text(args.system, metrics)
         return {
-            "records": records,
+            "records": all_records,
             "metrics": metrics,
             "result_text": result_text,
-            "raw_output": raw_output,
+            "raw_output": all_raw_output,
         }
     finally:
         system.exit()

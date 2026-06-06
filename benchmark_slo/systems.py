@@ -17,13 +17,16 @@ class BenchmarkSystem:
     needs_slo_ratio: bool
     seq_id_to_request_id: dict[int, int]
 
-    def add_request(self, prompt: str | list[int], sampling_params: Any, slo_ratio: float) -> None:
+    def add_request(self, prompt: str | list[int], sampling_params: Any, slo_ratio: float, request_id: int | None = None) -> int:
         sampling_params = copy.deepcopy(sampling_params)
         if self.needs_slo_ratio:
             seq_id = self.engine.add_request(prompt, sampling_params, slo_ratio=slo_ratio)
         else:
             seq_id = self.engine.add_request(prompt, sampling_params)
-        self.seq_id_to_request_id[seq_id] = len(self.seq_id_to_request_id)
+        if request_id is None:
+            request_id = len(self.seq_id_to_request_id)
+        self.seq_id_to_request_id[seq_id] = request_id
+        return seq_id
 
     def run(self):
         run_method = getattr(self.engine, self.run_method_name)

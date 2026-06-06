@@ -99,7 +99,7 @@ class RunWorkloadFormattingTests(unittest.TestCase):
                 self.exited = False
                 self.next_seq_id = 10
 
-            def add_request(self, prompt, sampling_params, slo_ratio):
+            def add_request(self, prompt, sampling_params, slo_ratio, request_id=None):
                 seq_id = self.next_seq_id
                 self.next_seq_id += 1
                 self.requests.append((seq_id, prompt, sampling_params.max_tokens, slo_ratio))
@@ -135,6 +135,7 @@ class RunWorkloadFormattingTests(unittest.TestCase):
             load_workload_fn=lambda _: workload,
             create_system_fn=lambda *_: fake_system,
             sampling_params_cls=FakeSamplingParams,
+            token_count_fn=lambda prompt: len(prompt),
         )
 
         self.assertEqual(
@@ -159,7 +160,7 @@ class RunWorkloadFormattingTests(unittest.TestCase):
                 self.calls = []
                 self.exited = False
 
-            def add_request(self, prompt, sampling_params, slo_ratio):
+            def add_request(self, prompt, sampling_params, slo_ratio, request_id=None):
                 seq_id = self.seq_ids[len(self.calls)]
                 self.calls.append((seq_id, prompt, sampling_params.max_tokens, slo_ratio))
                 return seq_id
@@ -193,6 +194,7 @@ class RunWorkloadFormattingTests(unittest.TestCase):
             load_workload_fn=lambda _: workload,
             create_system_fn=lambda *_: fake_system,
             sampling_params_cls=FakeSamplingParams,
+            token_count_fn=lambda prompt: len(prompt),
         )
 
         self.assertEqual(
@@ -215,7 +217,7 @@ class RunWorkloadFormattingTests(unittest.TestCase):
             def __init__(self):
                 self.exited = False
 
-            def add_request(self, prompt, sampling_params, slo_ratio):
+            def add_request(self, prompt, sampling_params, slo_ratio, request_id=None):
                 return len(prompt)
 
             def run(self):
@@ -246,6 +248,7 @@ class RunWorkloadFormattingTests(unittest.TestCase):
             load_workload_fn=lambda _: workload,
             create_system_fn=lambda *_: FakeSystem(),
             sampling_params_cls=FakeSamplingParams,
+            token_count_fn=lambda prompt: len(prompt),
         )
 
         self.assertEqual(len(result["records"]), 2)
