@@ -159,16 +159,13 @@ def run_workload(
         max_num_batched_tokens=getattr(args, 'max_num_batched_tokens', 8192),
         token_count_fn=token_count_fn,
     )
-    system = None
+    system = create_system_fn(args.system, args)
     all_records = []
     all_raw_output = []
     total_elapsed_time_s = 0.0
 
     try:
         for batch in batches:
-            if system is None:
-                system = create_system_fn(args.system, args)
-
             local_seq_id_to_request_id: dict[int, int] = {}
             for request in batch:
                 sampling_params = sampling_params_cls(
@@ -198,10 +195,6 @@ def run_workload(
             all_records.extend(batch_records)
             all_raw_output.extend(raw_output)
 
-            if not getattr(system, "supports_batch_reuse", True):
-                system.exit()
-                system = None
-
         metrics = compute_metrics_fn(all_records, total_elapsed_time_s)
         result_text = format_result_text(args.system, metrics)
         return {
@@ -211,8 +204,7 @@ def run_workload(
             "raw_output": all_raw_output,
         }
     finally:
-        if system is not None:
-            system.exit()
+        system.exit()
 
 
 def main() -> None:

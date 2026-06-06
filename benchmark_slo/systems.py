@@ -16,7 +16,6 @@ class BenchmarkSystem:
     num_pearl_steps: int
     needs_slo_ratio: bool
     seq_id_to_request_id: dict[int, int]
-    supports_batch_reuse: bool = True
 
     def add_request(self, prompt: str | list[int], sampling_params: Any, slo_ratio: float, request_id: int | None = None) -> int:
         sampling_params = copy.deepcopy(sampling_params)
@@ -121,5 +120,4 @@ def create_system(
         num_pearl_steps=args.num_pearl_steps,
         needs_slo_ratio=True,
         seq_id_to_request_id={},
-        supports_batch_reuse=False,
     )

@@ -64,6 +64,10 @@ class SLOTargetRunner(ModelRunnerBase):
                 result.append(SLOSequence(seq))
         return result
 
+    def _filter_active_batch(self, seqs):
+        running_ids = {seq.seq_id for seq in self.scheduler.running}
+        return [seq for seq in seqs if seq.seq_id in running_ids]
+
     def prepare_pearl_decode(self, seqs, gamma_map):
         """Prepare decode inputs with per-seq gamma.
 
@@ -515,6 +519,7 @@ class SLOTargetRunner(ModelRunnerBase):
         # 初始指针对齐
         curr_target_batch = batch_0
         next_target_batch = batch_1
+        fallback_to_single_batch = False
 
         while not self.scheduler.is_finished():
             print(f"--- [Target Side] Waiting for Draft data (B1)... ---")
@@ -523,12 +528,21 @@ class SLOTargetRunner(ModelRunnerBase):
 
             print(f"--- [Target Side] Finished RunModel for B1. Now sending results back... ---")
             # B. 判定并发送：将结果返回给 Draft (同步点)
-            # 在执行此步时，Draft 可能已经起草完了 Batch Y
             self.verify_double_buffer_send(logits, curr_target_batch, temps, g_map, msg, num_v)
+
+            curr_target_batch = self._filter_active_batch(curr_target_batch)
+            next_target_batch = self._filter_active_batch(next_target_batch)
+            if not curr_target_batch or not next_target_batch:
+                fallback_to_single_batch = True
+                break
 
             print(f"--- [Target Side] Results sent for B1. Moving to next batch... ---")
             # C. 轮换 Batch
             curr_target_batch, next_target_batch = next_target_batch, curr_target_batch
+
+        if fallback_to_single_batch:
+            while not self.scheduler.is_finished():
+                self.pearl_step()
 
         torch.cuda.synchronize()
         wall_end = _time.time()
@@ -565,16 +579,24 @@ class SLOTargetRunner(ModelRunnerBase):
         curr_target_batch = batch_0
         next_target_batch = batch_1
 
-        # 这里的步数必须与 Draft 严格对齐 (num_pearl_steps + 1 轮)
-        # 因为 Draft 在 Prime 阶段多发了一个 batch，在最后需要多收一个 batch。
-        # 实际代码中，Draft 跑了 num_pearl_steps 次 Loop，总共发了 num_pearl_steps + 1 个验证请求。
-        for _ in range(num_pearl_steps + 1):
+        steps_completed = 0
+        for _ in range(num_pearl_steps):
             print(f"--- [Target Side] Waiting for Draft data (B1)... ---")
             logits, msg, num_v, temps, g_map = self.verify_double_buffer_recv_and_run(curr_target_batch)
             print(f"--- [Target Side] Finished RunModel for B1. Now sending results back... ---")
             self.verify_double_buffer_send(logits, curr_target_batch, temps, g_map, msg, num_v)
+            steps_completed += 1
+
+            curr_target_batch = self._filter_active_batch(curr_target_batch)
+            next_target_batch = self._filter_active_batch(next_target_batch)
+            if not curr_target_batch or not next_target_batch:
+                break
+
             print(f"--- [Target Side] Results sent for B1. Moving to next batch... ---")
             curr_target_batch, next_target_batch = next_target_batch, curr_target_batch
+
+        for _ in range(num_pearl_steps - steps_completed):
+            self.pearl_step()
 
         torch.cuda.synchronize()
         end_time = _time.time()

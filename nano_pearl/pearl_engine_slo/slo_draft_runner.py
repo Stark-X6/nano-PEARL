@@ -95,6 +95,10 @@ class SLODraftRunner(ModelRunnerBase):
     def max_gamma(self):
         return self._slo_max_gamma
 
+    def _filter_active_batch(self, seqs):
+        running_ids = {seq.seq_id for seq in self.scheduler.running}
+        return [seq for seq in seqs if seq.seq_id in running_ids]
+
     def pearl_step(self):
         """SLO-aware drafting: draft max_gamma, compute probs, allocate, rollback, verify.
 
@@ -583,15 +587,23 @@ class SLODraftRunner(ModelRunnerBase):
         curr_verify_g_map = g_map_0
 
         # 3. Loop 阶段：核心流水线
+        fallback_to_single_batch = False
         while not self.scheduler.is_finished():
             print(f"--- [Draft Side] Starting Draft Loop for Batch {curr_draft_batch[0].seq_id if curr_draft_batch else 'N/A'} ---")
-            # A. 并行点：起草下一批 (此时 Target 正在并行验证上一批)
-            l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
+            l_next = i_next = None
+            if curr_draft_batch:
+                # A. 并行点：起草下一批 (此时 Target 正在并行验证上一批)
+                l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
 
             print(f"--- [Draft Side] Finished Drafting B1. Now waiting for B0 verification... ---")
             # B. 同步点：等待并接收上一批的验证结果
-            # 如果此时验证还没完，Draft 会阻塞在此处
             self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
+
+            curr_verify_batch = self._filter_active_batch(curr_verify_batch)
+            curr_draft_batch = self._filter_active_batch(curr_draft_batch)
+            if not curr_verify_batch or not curr_draft_batch:
+                fallback_to_single_batch = True
+                break
 
             print(f"--- [Draft Side] Received B0 results. Updating status... ---")
             # C. 发送点：将刚刚起草完的数据发给 Target
@@ -601,8 +613,9 @@ class SLODraftRunner(ModelRunnerBase):
             curr_draft_batch, curr_verify_batch = curr_verify_batch, curr_draft_batch
             curr_verify_g_map = g_map_next
 
-        #e2
-        self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
+        if fallback_to_single_batch:
+            while not self.scheduler.is_finished():
+                self.pearl_step()
 
         # 4. 结果输出
         end_time.record()
@@ -658,24 +671,33 @@ class SLODraftRunner(ModelRunnerBase):
         curr_verify_g_map = g_map_0
 
         # Loop 阶段：固定步数循环
+        steps_completed = 0
         for _ in range(num_pearl_steps):
             print(f"--- [Draft Side] Starting Draft Loop for Batch {curr_draft_batch[0].seq_id if curr_draft_batch else 'N/A'} ---")
-            # A. 异步起草 (与 Target 并行)
-            l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
+            l_next = i_next = None
+            if curr_draft_batch:
+                # A. 异步起草 (与 Target 并行)
+                l_next, i_next = self.draft_batch_double_buffer(curr_draft_batch)
 
             print(f"--- [Draft Side] Finished Drafting B1. Now waiting for B0 verification... ---")
             # B. 接收验证结果 (同步点)
             self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
-            
+            steps_completed += 1
+
+            curr_verify_batch = self._filter_active_batch(curr_verify_batch)
+            curr_draft_batch = self._filter_active_batch(curr_draft_batch)
+            if not curr_verify_batch or not curr_draft_batch:
+                break
+
             print(f"--- [Draft Side] Received B0 results. Updating status... ---")
             # C. 发送新验证请求
             g_map_next = self.verify_double_buffer_send(curr_draft_batch, l_next, i_next)
             # D. 指针轮换
             curr_draft_batch, curr_verify_batch = curr_verify_batch, curr_draft_batch
             curr_verify_g_map = g_map_next
-        
-        #e1
-        self.verify_double_buffer_recv(curr_verify_batch, curr_verify_g_map)
+
+        for _ in range(num_pearl_steps - steps_completed):
+            self.pearl_step()
 
         # 4. 完成后收集结果
         torch.cuda.synchronize()
