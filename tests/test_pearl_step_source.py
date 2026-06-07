@@ -56,6 +56,31 @@ class PearlStepSourceTests(unittest.TestCase):
         body = match.group(1)
         self.assertNotIn('assert not is_prefill', body)
 
+    def test_draft_vllm_spec_step_uses_serialized_path(self):
+        match = re.search(
+            r"class DraftModelRunner.*?def vllm_spec_step\(self\):(.*?)@torch.inference_mode",
+            SOURCE,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        body = match.group(1)
+        self.assertIn("self.serialized_pearl_step()", body)
+        self.assertNotIn("self.pearl_step()", body)
+
+    def test_target_vllm_spec_step_uses_serialized_path(self):
+        match = re.search(
+            r"class TargetModelRunner.*?def vllm_spec_step\(self\):(.*?)@torch.inference_mode",
+            SOURCE,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        body = match.group(1)
+        self.assertIn("self.serialized_pearl_step()", body)
+        self.assertNotIn("self.pearl_step()", body)
+
+    def test_runner_source_defines_serialized_pearl_steps(self):
+        self.assertEqual(SOURCE.count("def serialized_pearl_step(self):"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

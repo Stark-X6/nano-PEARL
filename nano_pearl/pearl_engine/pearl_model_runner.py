@@ -740,9 +740,36 @@ class DraftModelRunner(ModelRunnerBase):
             self.verify(seqs)
 
     def vllm_spec_step(self):
-        # Keep an explicit baseline hook instead of aliasing the PEARL path in
-        # the engine layer. This makes the formal benchmark switchboard simpler.
-        self.pearl_step()
+        self.serialized_pearl_step()
+
+    def serialized_pearl_step(self):
+        seqs = []
+        for _ in range(self.gamma):
+            seqs, is_prefill = self.scheduler.schedule()
+            if is_prefill:
+                input_ids, positions = self.prepare_prefill(seqs)
+                temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
+                logits = self.run_model(input_ids, positions, True)
+                sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+                dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+                token_ids = sample_tokens.tolist()
+                reset_context(self.tp_params)
+                self.scheduler.postprocess(seqs, token_ids)
+                continue
+
+            input_ids, positions = self.prepare_pearl_decode(seqs)
+            logits = self.run_model(input_ids, positions, False)
+            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            token_ids = sample_tokens.tolist()
+            reset_context(self.tp_params)
+
+            for seq, token_id in zip(seqs, token_ids):
+                seq.append_token(token_id)
+
+        dist.barrier()
+        if seqs:
+            self.verify(seqs)
 
     @torch.inference_mode()
     def verify(self, seqs: list[Sequence]):
@@ -842,7 +869,26 @@ class TargetModelRunner(ModelRunnerBase):
         self.verify(logits, seqs, temperatures)
 
     def vllm_spec_step(self):
-        self.pearl_step()
+        self.serialized_pearl_step()
+
+    def serialized_pearl_step(self):
+        dist.barrier()
+        seqs, is_prefill = self.scheduler.schedule()
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+            temperatures = self.prepare_sample(seqs) if self.tp_params.local_rank == 0 else None
+            logits = self.run_model(input_ids, positions, True)
+            sample_tokens = self.sampler(logits, temperatures) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            token_ids = sample_tokens.tolist()
+            reset_context(self.tp_params)
+            self.scheduler.postprocess(seqs, token_ids)
+            return
+
+        input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
+        temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
+        logits = self.run_model(input_ids, positions, False)
+        self.verify(logits, seqs, temperatures)
 
     @torch.inference_mode()
     def verify(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor):
