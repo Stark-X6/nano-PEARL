@@ -11,6 +11,7 @@ Provides:
   - profile_baseline_latency() for auto-profiling
 """
 
+import os
 import pickle
 import time
 from dataclasses import dataclass
