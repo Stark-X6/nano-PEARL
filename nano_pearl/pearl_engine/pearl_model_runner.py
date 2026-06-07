@@ -71,6 +71,8 @@ class ModelRunnerBase:
         pid = os.getpid()
         world_size = self.global_config.world_size
         current_device = torch.device(f"cuda:{rank}")
+        nccl_timeout_minutes = int(os.environ.get("PEARL_NCCL_TIMEOUT_MINUTES", "10"))
+        nccl_timeout = timedelta(minutes=nccl_timeout_minutes)
 
         def _log(msg: str):
             print(f"[Rank {rank} pid={pid}] {msg}", flush=True)
@@ -102,7 +104,7 @@ class ModelRunnerBase:
                 world_size=world_size,
                 rank=rank,
                 device_id=current_device,
-                timeout=timedelta(minutes=1),
+                timeout=nccl_timeout,
             )
             _log("after init_process_group")
 
@@ -116,7 +118,7 @@ class ModelRunnerBase:
                 ranks=draft_ranks,
                 backend="nccl",
                 device_id=current_device,
-                timeout=timedelta(minutes=1),
+                timeout=nccl_timeout,
             )
             _log("draft_group created")
 
@@ -129,7 +131,7 @@ class ModelRunnerBase:
                 ranks=target_ranks,
                 backend="nccl",
                 device_id=current_device,
-                timeout=timedelta(minutes=1),
+                timeout=nccl_timeout,
             )
             _log("target_group created")
 
@@ -149,7 +151,7 @@ class ModelRunnerBase:
                     ranks=verify_ranks,
                     backend="nccl",
                     device_id=current_device,
-                    timeout=timedelta(minutes=1),
+                    timeout=nccl_timeout,
                 )
                 _log("verify_group created")
 

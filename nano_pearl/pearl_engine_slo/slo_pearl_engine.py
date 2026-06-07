@@ -30,6 +30,12 @@ from nano_pearl.pearl_engine_slo.slo_sequence import SLOSequence
 from nano_pearl.utils.pearl_logger import logger
 
 
+def _sanitize_runtime_env():
+    omp_threads = os.environ.get("OMP_NUM_THREADS", "").strip()
+    if not omp_threads.isdigit() or int(omp_threads) <= 0:
+        os.environ["OMP_NUM_THREADS"] = "1"
+
+
 @dataclass
 class SLOGenerationMetrics:
     """Metrics collected per SLO generation run."""
@@ -62,6 +68,8 @@ class SLOController(Controller):
 
 
 class SLOPearlEngine:
+    _sanitize_runtime_env = staticmethod(_sanitize_runtime_env)
+
     """SLO-aware PEARL engine.
 
     Composes SLOConfig and spawns SLODraftRunner / SLOTargetRunner processes.
@@ -77,6 +85,7 @@ class SLOPearlEngine:
         self.slo_config = slo_config
         self.config = slo_config.pearl_config
         self.ps = []
+        self._sanitize_runtime_env()
 
         ctx = mp.get_context("spawn")
         self.done_events = [ctx.Event() for _ in range(self.config.world_size)]

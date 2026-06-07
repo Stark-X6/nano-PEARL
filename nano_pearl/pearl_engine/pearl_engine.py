@@ -14,6 +14,12 @@ from nano_pearl.pearl_engine.sequence import Sequence
 from nano_pearl.layers.sampler import SamplingParams
 
 
+def _sanitize_runtime_env():
+    omp_threads = os.environ.get("OMP_NUM_THREADS", "").strip()
+    if not omp_threads.isdigit() or int(omp_threads) <= 0:
+        os.environ["OMP_NUM_THREADS"] = "1"
+
+
 class Controller:
     def __init__(self, config: PEARLConfig, control_event: Event):
         self.config = config
@@ -53,9 +59,12 @@ class Controller:
 
 
 class PEARLEngine:    
+    _sanitize_runtime_env = staticmethod(_sanitize_runtime_env)
+
     def __init__(self, config: PEARLConfig):
         self.config = config
         self.ps = []
+        self._sanitize_runtime_env()
         
         ctx = mp.get_context("spawn")
         # each process has its own completion event to signal the main process
